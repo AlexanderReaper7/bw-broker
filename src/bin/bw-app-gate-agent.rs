@@ -1,208 +1,261 @@
-use anyhow::{anyhow, Result};
-use bw_app_gate::{
-    cache_key, decrypt_secret_in_process, parent_executable, prompt_pinentry, session_salt,
-    socket_path, GetSecretRequest, SecretResponse, DEFAULT_TTL_SECS,
-};
-use std::collections::{HashMap, HashSet};
-use std::fs::{self, Permissions};
+use anyhow::{anyhow, bail, Context, Result};
+use bw_app_gate::cache::Cache;
+use bw_app_gate::process::{self, app_label, Requester};
+use bw_app_gate::prompt::Approval;
+use bw_app_gate::secret_ref::SecretRef;
+use bw_app_gate::vault::{self, SecretValue, UnlockError};
+use bw_app_gate::{socket_path, Request, Response, MAX_REQUEST_BYTES, MAX_SECRETS_PER_REQUEST};
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-use sysinfo::Pid;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
+use zeroize::Zeroizing;
 
-struct CacheEntry {
-    secret_value: String,
-    expires_at: u64,
+const USAGE: &str = "Usage: bw-app-gate-agent [--pinentry PROGRAM]";
+
+/// Wrong master passwords accepted in one prompt before the request fails.
+const PASSWORD_ATTEMPTS: usize = 3;
+
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
+const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+struct Agent {
+    pinentry: String,
+    cache: Mutex<Cache>,
+    /// Held while a prompt is open, so only one dialog shows at a time. The cache lock is not held during the prompt.
+    prompt: Mutex<()>,
 }
 
-struct Policy {
-    allowed: HashMap<String, HashSet<String>>,
+/// Seconds on `CLOCK_BOOTTIME`, which unlike `Instant` keeps counting through suspend, so an idle timer also runs out while the machine sleeps.
+fn now() -> u64 {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let result = unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut time) };
+    assert_eq!(result, 0, "CLOCK_BOOTTIME is unavailable");
+    time.tv_sec as u64
 }
 
-impl Policy {
-    fn from_specs(specs: &[String]) -> Result<Self> {
-        let mut allowed = HashMap::new();
-        for spec in specs {
-            let (app_path, secret_name) = spec
-                .split_once('=')
-                .ok_or_else(|| anyhow!("policy must use APP_PATH=SECRET_NAME"))?;
-            if app_path.is_empty() || secret_name.is_empty() {
-                return Err(anyhow!("policy app path and secret name cannot be empty"));
-            }
-            allowed
-                .entry(app_path.to_string())
-                .or_insert_with(HashSet::new)
-                .insert(secret_name.to_string());
+impl Agent {
+    async fn serve(
+        &self,
+        requester: &Requester,
+        names: &[String],
+    ) -> Result<Vec<Zeroizing<String>>> {
+        if names.is_empty() || names.len() > MAX_SECRETS_PER_REQUEST {
+            bail!("a request must name between 1 and {MAX_SECRETS_PER_REQUEST} secrets");
         }
-        Ok(Self { allowed })
+        let secrets = names
+            .iter()
+            .map(|name| SecretRef::parse(name))
+            .collect::<Result<Vec<_>>>()?;
+        let instance = requester.instance;
+
+        if self
+            .cache
+            .lock()
+            .await
+            .missing(instance, &secrets, now())
+            .is_empty()
+        {
+            return self.read_cached(requester, &secrets).await;
+        }
+
+        let _prompt = self.prompt.lock().await;
+        // Another request from the same instance may have filled the cache while this one waited for the prompt lock.
+        let missing = self.cache.lock().await.missing(instance, &secrets, now());
+        if !missing.is_empty() {
+            let pinentry = self.pinentry.clone();
+            let app = app_label(&requester.exe);
+            let pid = instance.pid;
+            let fetch_missing = missing.clone();
+            let values = tokio::task::spawn_blocking(move || {
+                approve_and_fetch(&Approval {
+                    pinentry: &pinentry,
+                    app: &app,
+                    pid,
+                    secrets: &fetch_missing,
+                })
+            })
+            .await??;
+            let mut cache = self.cache.lock().await;
+            let now = now();
+            for (secret, value) in missing.into_iter().zip(values) {
+                cache.insert(instance, secret, value, now);
+            }
+        }
+        self.read_cached(requester, &secrets).await
     }
 
-    fn allows(&self, app_path: &str, secret_name: &str) -> bool {
-        self.allowed
-            .get(app_path)
-            .is_some_and(|secrets| secrets.contains(secret_name))
+    async fn read_cached(
+        &self,
+        requester: &Requester,
+        secrets: &[SecretRef],
+    ) -> Result<Vec<Zeroizing<String>>> {
+        let mut cache = self.cache.lock().await;
+        let now = now();
+        secrets
+            .iter()
+            .map(|secret| {
+                cache
+                    .get(requester.instance, secret, now)
+                    .ok_or_else(|| {
+                        anyhow!("'{secret}' expired while the request was waiting; retry")
+                    })?
+                    .reveal()
+            })
+            .collect()
     }
 }
 
-struct DaemonState {
-    policy: Policy,
-    salt: [u8; 32],
-    cache: HashMap<String, CacheEntry>,
+/// Shows the prompt, unlocks the vault with the password and decrypts the secrets. Blocking: runs pinentry and the KDF.
+fn approve_and_fetch(approval: &Approval) -> Result<Vec<SecretValue>> {
+    let mut error = None;
+    for _ in 0..PASSWORD_ATTEMPTS {
+        let password = approval
+            .ask(error)?
+            .ok_or_else(|| anyhow!("denied by the user"))?;
+        match vault::unlock(&password) {
+            Ok(vault) => return vault.fetch(approval.secrets),
+            Err(UnlockError::WrongPassword) => error = Some("Wrong master password"),
+            Err(UnlockError::Other(error)) => return Err(error),
+        }
+    }
+    bail!("wrong master password {PASSWORD_ATTEMPTS} times")
+}
+
+async fn read_request(stream: &mut UnixStream) -> Result<Request> {
+    let mut line = Vec::new();
+    let reader = BufReader::new(stream).take(MAX_REQUEST_BYTES as u64 + 1);
+    tokio::pin!(reader);
+    tokio::time::timeout(READ_TIMEOUT, reader.read_until(b'\n', &mut line))
+        .await
+        .context("timed out reading the request")??;
+    if line.len() > MAX_REQUEST_BYTES {
+        bail!("request is longer than {MAX_REQUEST_BYTES} bytes");
+    }
+    serde_json::from_slice(&line).context("invalid request")
+}
+
+async fn handle_connection(agent: &Agent, mut stream: UnixStream) -> Result<()> {
+    let credentials = stream.peer_cred()?;
+    if credentials.uid() != unsafe { libc::getuid() } {
+        bail!("connection from another user (uid {})", credentials.uid());
+    }
+    let peer_pid = credentials
+        .pid()
+        .ok_or_else(|| anyhow!("peer PID is unavailable"))?;
+
+    let response = match process::find_requester(peer_pid as u32) {
+        Ok(requester) => match read_request(&mut stream).await {
+            Ok(request) => match agent.serve(&requester, &request.secrets).await {
+                Ok(values) => {
+                    Response::Secrets(values.iter().map(|value| value.to_string()).collect())
+                }
+                Err(error) => Response::Error(format!("{error:#}")),
+            },
+            Err(error) => Response::Error(format!("{error:#}")),
+        },
+        Err(error) => Response::Error(format!(
+            "could not identify the requesting application: {error:#}"
+        )),
+    };
+
+    let mut line = Zeroizing::new(serde_json::to_vec(&response)?);
+    if let Response::Secrets(mut values) = response {
+        values.iter_mut().for_each(zeroize::Zeroize::zeroize);
+    }
+    line.push(b'\n');
+    stream.write_all(&line).await?;
+    Ok(())
 }
 
 fn disable_tracing() -> Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        const PR_SET_DUMPABLE: i32 = 4;
-        let ret = unsafe { libc::prctl(PR_SET_DUMPABLE, 0) };
-        if ret != 0 {
-            return Err(anyhow!(
-                "failed to disable debugger attachment: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
+    const PR_SET_DUMPABLE: i32 = 4;
+    if unsafe { libc::prctl(PR_SET_DUMPABLE, 0) } != 0 {
+        bail!(
+            "failed to disable debugger attachment: {}",
+            std::io::Error::last_os_error()
+        );
     }
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn policy_allows_only_declared_app_secret_pairs() {
-        let policy = Policy::from_specs(&[
-            "/usr/bin/editor=api-token".to_string(),
-            "/usr/bin/editor=db-password".to_string(),
-        ])
-        .expect("policy should parse");
-
-        assert!(policy.allows("/usr/bin/editor", "api-token"));
-        assert!(policy.allows("/usr/bin/editor", "db-password"));
-        assert!(!policy.allows("/usr/bin/editor", "root-password"));
-        assert!(!policy.allows("/usr/bin/browser", "api-token"));
+/// Binds the socket, refusing to take it over from an agent that is still running.
+fn bind_socket() -> Result<UnixListener> {
+    let path = socket_path();
+    if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+        bail!(
+            "another bw-app-gate-agent is already listening on {}",
+            path.display()
+        );
     }
-
-    #[test]
-    fn policy_rejects_malformed_specs() {
-        assert!(Policy::from_specs(&["/usr/bin/editor".to_string()]).is_err());
-        assert!(Policy::from_specs(&["=api-token".to_string()]).is_err());
-        assert!(Policy::from_specs(&["/usr/bin/editor=".to_string()]).is_err());
+    match std::fs::remove_file(&path) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+        _ => {}
     }
+    // umask makes the socket 0600 from the moment it exists, with no window before set_permissions.
+    let old_umask = unsafe { libc::umask(0o077) };
+    let listener = UnixListener::bind(&path);
+    unsafe { libc::umask(old_umask) };
+    let listener = listener.with_context(|| format!("failed to bind {}", path.display()))?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(listener)
 }
 
-async fn get_cached_secret(
-    state: &mut DaemonState,
-    app_path: &str,
-    secret_name: &str,
-) -> Result<String> {
-    if !state.policy.allows(app_path, secret_name) {
-        return Err(anyhow!(
-            "application '{}' is not authorized for secret '{}'",
-            app_path,
-            secret_name
-        ));
-    }
-
-    let key = cache_key(&state.salt, app_path, secret_name);
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    if let Some(entry) = state.cache.get(&key) {
-        if entry.expires_at > now {
-            return Ok(entry.secret_value.clone());
+fn parse_args() -> Result<String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.as_slice() {
+        [] => Ok("pinentry".to_string()),
+        [flag, program] if flag == "--pinentry" => Ok(program.clone()),
+        [flag] if flag == "-h" || flag == "--help" => {
+            println!("{USAGE}");
+            std::process::exit(0);
         }
+        _ => Err(anyhow!("{USAGE}")),
     }
-
-    let password = prompt_pinentry(app_path, secret_name)?;
-    let secret_value = decrypt_secret_in_process(password, secret_name).await?;
-    state.cache.insert(
-        key,
-        CacheEntry {
-            secret_value: secret_value.clone(),
-            expires_at: now + DEFAULT_TTL_SECS,
-        },
-    );
-    Ok(secret_value)
-}
-
-async fn handle_connection(stream: UnixStream, state: Arc<Mutex<DaemonState>>) -> Result<()> {
-    let peer_pid = stream
-        .peer_cred()?
-        .pid()
-        .ok_or_else(|| anyhow!("peer PID is unavailable on this platform"))?;
-    let app_path = parent_executable(Pid::from_u32(peer_pid as u32))?;
-    let (reader, mut writer) = stream.into_split();
-    let mut line = String::new();
-    BufReader::new(reader).read_line(&mut line).await?;
-
-    let response = match serde_json::from_str::<GetSecretRequest>(&line) {
-        Ok(request) => {
-            let mut state = state.lock().await;
-            match get_cached_secret(&mut state, &app_path, &request.secret_name).await {
-                Ok(secret_value) => SecretResponse {
-                    secret_value: Some(secret_value),
-                    error: None,
-                },
-                Err(error) => SecretResponse {
-                    secret_value: None,
-                    error: Some(error.to_string()),
-                },
-            }
-        }
-        Err(error) => SecretResponse {
-            secret_value: None,
-            error: Some(format!("invalid request: {error}")),
-        },
-    };
-
-    writer
-        .write_all(serde_json::to_string(&response)?.as_bytes())
-        .await?;
-    writer.write_all(b"\n").await?;
-    Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     disable_tracing()?;
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 || args[1] != "--allow" {
-        eprintln!("Usage: bw-app-gate-agent --allow APP_PATH=SECRET_NAME [...]");
-        std::process::exit(if args.len() < 3 { 1 } else { 0 });
-    }
+    let pinentry = parse_args()?;
+    let listener = bind_socket()?;
+    let agent = Arc::new(Agent {
+        pinentry,
+        cache: Mutex::new(Cache::default()),
+        prompt: Mutex::new(()),
+    });
 
-    let policy = Policy::from_specs(&args[2..].to_vec())?;
-    let path = socket_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let _ = fs::remove_file(&path);
-    let listener = UnixListener::bind(&path)?;
-    fs::set_permissions(&path, Permissions::from_mode(0o600))?;
-    let state = Arc::new(Mutex::new(DaemonState {
-        policy,
-        salt: session_salt()?,
-        cache: HashMap::new(),
-    }));
+    let sweeper = agent.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(SWEEP_INTERVAL);
+        loop {
+            interval.tick().await;
+            sweeper.cache.lock().await.sweep(now(), process::is_alive);
+        }
+    });
 
-    eprintln!("bw-app-gate-agent listening on {}", path.display());
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    eprintln!("bw-app-gate-agent listening on {}", socket_path().display());
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
-                let state = state.clone();
+                let agent = agent.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = handle_connection(stream, state).await {
+                    if let Err(error) = handle_connection(&agent, stream).await {
                         eprintln!("request failed: {error:#}");
                     }
                 });
             }
-            _ = tokio::signal::ctrl_c() => {
-                let _ = fs::remove_file(&path);
-                return Ok(());
-            }
+            _ = tokio::signal::ctrl_c() => break,
+            _ = terminate.recv() => break,
         }
     }
+    let _ = std::fs::remove_file(socket_path());
+    Ok(())
 }

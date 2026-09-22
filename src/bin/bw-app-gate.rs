@@ -1,34 +1,69 @@
-use anyhow::{anyhow, Result};
-use bw_app_gate::{socket_path, GetSecretRequest, SecretResponse};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
+use anyhow::{anyhow, Context, Result};
+use bw_app_gate::{socket_path, Request, Response};
+use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+use zeroize::Zeroizing;
 
-async fn request_secret(secret_name: &str) -> Result<String> {
-    let mut stream = UnixStream::connect(socket_path()).await?;
-    let request = serde_json::to_string(&GetSecretRequest {
-        secret_name: secret_name.to_string(),
+const USAGE: &str = "\
+Usage: bw-app-gate get NAME...
+
+NAME is an item name, meaning its login password, or ITEM/FIELD where FIELD is
+username, notes, totp or a custom field name. Escape '/' and '\\' in names
+with a backslash.
+
+One NAME prints the value exactly, with no trailing newline.
+Several print a JSON object from NAME to value.";
+
+fn request(names: &[String]) -> Result<Vec<Zeroizing<String>>> {
+    let mut stream = UnixStream::connect(socket_path()).with_context(|| {
+        format!(
+            "failed to connect to {}; is bw-app-gate-agent running?",
+            socket_path().display()
+        )
     })?;
-    stream.write_all(request.as_bytes()).await?;
-    stream.write_all(b"\n").await?;
+    let mut line = serde_json::to_vec(&Request {
+        secrets: names.to_vec(),
+    })?;
+    line.push(b'\n');
+    stream.write_all(&line)?;
 
-    let (reader, _) = stream.into_split();
-    let mut line = String::new();
-    BufReader::new(reader).read_line(&mut line).await?;
-    let response: SecretResponse = serde_json::from_str(&line)?;
-    match (response.secret_value, response.error) {
-        (Some(secret), None) => Ok(secret),
-        (_, Some(error)) => Err(anyhow!(error)),
-        _ => Err(anyhow!("daemon returned an invalid response")),
+    let mut line = Zeroizing::new(String::new());
+    BufReader::new(stream).read_line(&mut line)?;
+    match serde_json::from_str::<Response>(&line)? {
+        Response::Secrets(values) => Ok(values.into_iter().map(Zeroizing::new).collect()),
+        Response::Error(error) => Err(anyhow!(error)),
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() != 2 || matches!(args[1].as_str(), "-h" | "--help") {
-        eprintln!("Usage: bw-app-gate SECRET_NAME");
-        std::process::exit(if args.len() == 2 { 0 } else { 1 });
+fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let names = match args.split_first() {
+        Some((command, names)) if command == "get" && !names.is_empty() => names,
+        Some((flag, [])) if flag == "-h" || flag == "--help" => {
+            println!("{USAGE}");
+            return Ok(());
+        }
+        _ => {
+            eprintln!("{USAGE}");
+            std::process::exit(2);
+        }
+    };
+
+    let values = request(names)?;
+    let mut stdout = std::io::stdout().lock();
+    if let [value] = values.as_slice() {
+        stdout.write_all(value.as_bytes())?;
+    } else {
+        let object: BTreeMap<&str, &str> = names
+            .iter()
+            .map(String::as_str)
+            .zip(values.iter().map(|value| value.as_str()))
+            .collect();
+        let mut json = Zeroizing::new(serde_json::to_vec(&object)?);
+        json.push(b'\n');
+        stdout.write_all(&json)?;
     }
-    println!("{}", request_secret(&args[1]).await?);
+    stdout.flush()?;
     Ok(())
 }
