@@ -9,8 +9,8 @@
 #
 # The rbw-agent never gets unlocked by anything here. Running `rbw unlock`
 # would let every process of this user read the vault through `rbw get`,
-# around the gate. `rbw login` unlocks it as a side effect, so it is run as
-# `rbw login && rbw lock`.
+# around the gate. `rbw login` unlocks it as a side effect, so logins go through
+# `bw-app-gate login`, which always runs `rbw lock` afterwards.
 self:
 {
   config,

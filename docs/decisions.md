@@ -38,6 +38,12 @@ The pinentry dialog names the application, its PID and the requested secrets mis
 
 The application is shown by its Nix package name without hash or version plus its file name (`claude-code/.claude-wrapped`), using the same split as `builtins.parseDrvName`. Other paths are shown in full.
 
+Since 2026-09-23 the dialog also shows the requester's working directory and the app that started it, found by the same shell-skipping walk. Two Claude Code sessions have the same executable, and the directory tells them apart. Both are hints the process controls, through `chdir` or by who it was started from, so neither is part of the identity. The full command line was considered and dropped: Claude Code's is about 300 characters, and argv can itself hold tokens.
+
+## Audit log: one journal line per request, names only (2026-09-23)
+
+The agent writes one line to stderr, so to the journal, for every request: the requester with its PID and working directory, the names, and the outcome. For `get` the outcome is either "all cached" or which names needed approval. A refusal includes its reason, and a `forget` includes the count. Values are never logged. The threat model is honest apps that should not get more than they need, and before this nothing showed what an app fetched or how often. Read it with `journalctl --user -u bw-app-gate-agent`.
+
 ## Unlock: master password on every cache miss, keys dropped afterwards
 
 The KDF runs once per approved request, and the vault keys live only for that request. A time-limited unlock, where a held key lets later prompts skip the password, is planned but not built. `vault::unlock` is the only place that would change.
@@ -69,6 +75,8 @@ The gate reads the encrypted vault copy that rbw keeps in `~/.cache/rbw`. rbw-ag
 Never run `rbw unlock` on this machine: an unlocked rbw-agent hands any secret to any process of the same user through `rbw get`, around the gate.
 
 `rbw login` unlocks the agent as well, which was missed at first. Its `login_success` in rbw 1.15 syncs and then calls `rbw::actions::unlock`, keeping the keys for `lock_timeout` (3600 s by default). Found on 2026-09-22 when `rbw unlocked` exited 0 right after the first login. Decided the same day: run `rbw login && rbw lock`, every time rbw asks for a login. Setting `lock_timeout = 1` in the module was the alternative, and would close the window without anyone having to remember. The user chose the documented step instead.
+
+On 2026-09-23 the step became a command, `bw-app-gate login`, so it does not rely on memory. It runs `rbw login` and then `rbw lock` whatever the login did, since `&&` skips the lock when a login fails after unlocking. It catches Ctrl-C, SIGTERM, SIGHUP and SIGQUIT with a handler that does nothing, rather than ignoring them. exec resets handled signals to their default, so Ctrl-C still stops `rbw login`, and this process lives on to lock. A shell script with a `trap` in the nix module was the alternative. It was dropped because the command would only exist through the module.
 
 ## Known non-goal: cold boot attacks
 

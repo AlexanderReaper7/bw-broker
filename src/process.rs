@@ -22,6 +22,10 @@ pub struct Instance {
 pub struct Requester {
     pub instance: Instance,
     pub exe: PathBuf,
+    /// Working directory, shown to help the user tell sessions apart. The process can change it at will, so it is a hint, never identity. `None` when unreadable.
+    pub cwd: Option<PathBuf>,
+    /// Executable of the nearest non-pass-through ancestor above the requester, also only a hint. `None` when there is none or it is unreadable.
+    pub parent: Option<PathBuf>,
 }
 
 struct Stat {
@@ -63,11 +67,12 @@ pub fn is_alive(instance: Instance) -> bool {
     read_stat(instance.pid).is_ok_and(|stat| stat.start_time == instance.start_time)
 }
 
-pub fn find_requester(peer_pid: u32) -> Result<Requester> {
-    let mut pid = peer_pid;
+/// The nearest process from `start` upwards whose executable is not in `PASS_THROUGH`, as its instance and executable.
+fn nearest_app(start: u32) -> Result<(Instance, u32, PathBuf)> {
+    let mut pid = start;
     loop {
         if pid <= 1 {
-            bail!("no requesting application found above process {peer_pid}");
+            bail!("no requesting application found above process {start}");
         }
         let stat = read_stat(pid)?;
         let exe = read_exe(pid)?;
@@ -77,15 +82,36 @@ pub fn find_requester(peer_pid: u32) -> Result<Requester> {
             if read_stat(pid)?.start_time != stat.start_time {
                 bail!("process {pid} changed while being inspected");
             }
-            return Ok(Requester {
-                instance: Instance {
-                    pid,
-                    start_time: stat.start_time,
-                },
-                exe,
-            });
+            let instance = Instance {
+                pid,
+                start_time: stat.start_time,
+            };
+            return Ok((instance, stat.ppid, exe));
         }
         pid = stat.ppid;
+    }
+}
+
+pub fn find_requester(peer_pid: u32) -> Result<Requester> {
+    let (instance, ppid, exe) = nearest_app(peer_pid)?;
+    Ok(Requester {
+        instance,
+        exe,
+        cwd: fs::read_link(format!("/proc/{}/cwd", instance.pid)).ok(),
+        parent: nearest_app(ppid).ok().map(|(_, _, exe)| exe),
+    })
+}
+
+/// `path` with the home directory written as `~`, for display.
+pub fn tilde(path: &Path) -> String {
+    tilde_in(path, std::env::var_os("HOME").as_deref().map(Path::new))
+}
+
+fn tilde_in(path: &Path, home: Option<&Path>) -> String {
+    match home.and_then(|home| path.strip_prefix(home).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
     }
 }
 
@@ -149,6 +175,16 @@ mod tests {
         let requester = find_requester(std::process::id()).expect("should resolve");
         assert_eq!(requester.instance.pid, std::process::id());
         assert_eq!(requester.exe, std::env::current_exe().unwrap());
+        assert_eq!(requester.cwd, Some(std::env::current_dir().unwrap()));
+    }
+
+    #[test]
+    fn tilde_replaces_only_a_whole_home_prefix() {
+        let home = Some(Path::new("/home/a"));
+        assert_eq!(tilde_in(Path::new("/home/a"), home), "~");
+        assert_eq!(tilde_in(Path::new("/home/a/src/x"), home), "~/src/x");
+        assert_eq!(tilde_in(Path::new("/home/ab"), home), "/home/ab");
+        assert_eq!(tilde_in(Path::new("/tmp"), None), "/tmp");
     }
 
     #[test]

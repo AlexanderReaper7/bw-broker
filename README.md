@@ -12,6 +12,8 @@ bw-app-gate forget                            # drop all of this program's appro
 
 `forget` only affects the program that runs it. To clear every program's approvals, restart the agent: `systemctl --user restart bw-app-gate-agent`.
 
+Every request is logged by name, never by value: `journalctl --user -u bw-app-gate-agent`.
+
 A name is `item`, `item/field`, `item[user]` or `item[user]/field`. `\` escapes `/`, `[`, `]` and `\` that are part of a name.
 
 The reasoning behind every choice, including what this does not protect against, is in [docs/decisions.md](docs/decisions.md).
@@ -34,7 +36,7 @@ services.bw-app-gate = {
 };
 ```
 
-After switching, run `rbw login && rbw lock`. Login leaves rbw-agent unlocked, and `rbw lock` closes that again. Do the same whenever rbw asks for a new login. Do not run `rbw unlock`: see the vault section of the decisions.
+After switching, run `bw-app-gate login`. It runs `rbw login` and then `rbw lock` even if the login fails or is interrupted, because login leaves rbw-agent unlocked. Do the same whenever rbw asks for a new login. Do not run `rbw unlock`: see the vault section of the decisions.
 
 ## API keys
 

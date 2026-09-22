@@ -12,6 +12,9 @@ pub struct Approval<'a> {
     pub pinentry: &'a str,
     pub app: &'a str,
     pub pid: u32,
+    /// Hints from the requester that it can change itself: its working directory and the app that started it.
+    pub cwd: Option<&'a str>,
+    pub parent: Option<&'a str>,
     pub secrets: &'a [SecretRef],
 }
 
@@ -22,8 +25,13 @@ impl Approval<'_> {
             .iter()
             .map(|secret| format!("\n  {secret}"))
             .collect();
+        let cwd = self.cwd.map(|cwd| format!("\nin {cwd}")).unwrap_or_default();
+        let parent = self
+            .parent
+            .map(|parent| format!("\nstarted by {parent}"))
+            .unwrap_or_default();
         format!(
-            "{} (pid {}) wants:{list}\n\nEnter the master password to approve.",
+            "{} (pid {}){cwd}{parent}\nwants:{list}\n\nEnter the master password to approve.",
             self.app, self.pid
         )
     }
@@ -65,11 +73,30 @@ mod tests {
             pinentry: "pinentry",
             app: "claude-code/.claude-wrapped",
             pid: 42,
+            cwd: Some("~/Projects/x"),
+            parent: Some("nodejs-slim/node"),
             secrets: &secrets,
         };
         assert_eq!(
             approval.description(),
-            "claude-code/.claude-wrapped (pid 42) wants:\n  github-token\n  npm/notes\n\nEnter the master password to approve."
+            "claude-code/.claude-wrapped (pid 42)\nin ~/Projects/x\nstarted by nodejs-slim/node\nwants:\n  github-token\n  npm/notes\n\nEnter the master password to approve."
+        );
+    }
+
+    #[test]
+    fn description_omits_unknown_hints() {
+        let secrets = [SecretRef::parse("a").unwrap()];
+        let approval = Approval {
+            pinentry: "pinentry",
+            app: "app",
+            pid: 1,
+            cwd: None,
+            parent: None,
+            secrets: &secrets,
+        };
+        assert_eq!(
+            approval.description(),
+            "app (pid 1)\nwants:\n  a\n\nEnter the master password to approve."
         );
     }
 }

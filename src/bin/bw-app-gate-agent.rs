@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use bw_app_gate::cache::Cache;
-use bw_app_gate::process::{self, app_label, Requester};
+use bw_app_gate::process::{self, app_label, tilde, Requester};
 use bw_app_gate::prompt::Approval;
 use bw_app_gate::secret_ref::SecretRef;
 use bw_app_gate::vault::{self, SecretValue, UnlockError};
@@ -40,11 +40,12 @@ fn now() -> u64 {
 }
 
 impl Agent {
+    /// Returns the values in request order, and the secrets that needed approval, empty when all came from the cache.
     async fn serve(
         &self,
         requester: &Requester,
         names: &[String],
-    ) -> Result<Vec<Zeroizing<String>>> {
+    ) -> Result<(Vec<Zeroizing<String>>, Vec<SecretRef>)> {
         if names.is_empty() || names.len() > MAX_SECRETS_PER_REQUEST {
             bail!("a request must name between 1 and {MAX_SECRETS_PER_REQUEST} secrets");
         }
@@ -61,7 +62,7 @@ impl Agent {
             .missing(instance, &secrets, now())
             .is_empty()
         {
-            return self.read_cached(requester, &secrets).await;
+            return Ok((self.read_cached(requester, &secrets).await?, Vec::new()));
         }
 
         let _prompt = self.prompt.lock().await;
@@ -71,23 +72,27 @@ impl Agent {
             let pinentry = self.pinentry.clone();
             let app = app_label(&requester.exe);
             let pid = instance.pid;
+            let cwd = requester.cwd.as_deref().map(tilde);
+            let parent = requester.parent.as_deref().map(app_label);
             let fetch_missing = missing.clone();
             let values = tokio::task::spawn_blocking(move || {
                 approve_and_fetch(&Approval {
                     pinentry: &pinentry,
                     app: &app,
                     pid,
+                    cwd: cwd.as_deref(),
+                    parent: parent.as_deref(),
                     secrets: &fetch_missing,
                 })
             })
             .await??;
             let mut cache = self.cache.lock().await;
             let now = now();
-            for (secret, value) in missing.into_iter().zip(values) {
+            for (secret, value) in missing.iter().cloned().zip(values) {
                 cache.insert(instance, secret, value, now);
             }
         }
-        self.read_cached(requester, &secrets).await
+        Ok((self.read_cached(requester, &secrets).await?, missing))
     }
 
     /// Drops the requester's own entries: the named ones, or all when `names` is empty. No prompt, since it only takes access away.
@@ -106,17 +111,41 @@ impl Agent {
             .forget(requester.instance, &secrets, now()))
     }
 
-    async fn handle(&self, requester: &Requester, request: Request) -> Result<Response> {
-        Ok(match request {
-            Request::Get(names) => Response::Secrets(
-                self.serve(requester, &names)
-                    .await?
-                    .iter()
-                    .map(|value| value.to_string())
-                    .collect(),
-            ),
-            Request::Forget(names) => Response::Forgot(self.forget(requester, &names).await?),
-        })
+    /// Serves one request and writes its outcome to the audit log, which is stderr and so the journal. Names only, never values.
+    async fn handle(&self, requester: &Requester, request: Request) -> Response {
+        let who = describe(requester);
+        match request {
+            Request::Get(names) => match self.serve(requester, &names).await {
+                Ok((values, approved)) => {
+                    let how = if approved.is_empty() {
+                        "all cached".to_string()
+                    } else {
+                        format!("approved {}", join(&approved))
+                    };
+                    eprintln!("{who} got {} ({how})", join(&names));
+                    Response::Secrets(values.iter().map(|value| value.to_string()).collect())
+                }
+                Err(error) => {
+                    eprintln!("{who} was refused {}: {error:#}", join(&names));
+                    Response::Error(format!("{error:#}"))
+                }
+            },
+            Request::Forget(names) => match self.forget(requester, &names).await {
+                Ok(count) => {
+                    let which = if names.is_empty() {
+                        "all".to_string()
+                    } else {
+                        join(&names)
+                    };
+                    eprintln!("{who} forgot {which} ({count} cached)");
+                    Response::Forgot(count)
+                }
+                Err(error) => {
+                    eprintln!("{who} failed to forget {}: {error:#}", join(&names));
+                    Response::Error(format!("{error:#}"))
+                }
+            },
+        }
     }
 
     async fn read_cached(
@@ -138,6 +167,28 @@ impl Agent {
             })
             .collect()
     }
+}
+
+/// The requester as the audit log names it: `claude-code/.claude-wrapped (pid 42, in ~/src)`.
+fn describe(requester: &Requester) -> String {
+    let cwd = requester
+        .cwd
+        .as_deref()
+        .map(|cwd| format!(", in {}", tilde(cwd)))
+        .unwrap_or_default();
+    format!(
+        "{} (pid {}{cwd})",
+        app_label(&requester.exe),
+        requester.instance.pid
+    )
+}
+
+fn join(names: &[impl std::fmt::Display]) -> String {
+    names
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Shows the prompt, unlocks the vault with the password and decrypts the secrets. Blocking: runs pinentry and the KDF.
@@ -180,15 +231,18 @@ async fn handle_connection(agent: &Agent, mut stream: UnixStream) -> Result<()> 
 
     let response = match process::find_requester(peer_pid as u32) {
         Ok(requester) => match read_request(&mut stream).await {
-            Ok(request) => agent
-                .handle(&requester, request)
-                .await
-                .unwrap_or_else(|error| Response::Error(format!("{error:#}"))),
-            Err(error) => Response::Error(format!("{error:#}")),
+            Ok(request) => agent.handle(&requester, request).await,
+            Err(error) => {
+                eprintln!("{} sent a bad request: {error:#}", describe(&requester));
+                Response::Error(format!("{error:#}"))
+            }
         },
-        Err(error) => Response::Error(format!(
-            "could not identify the requesting application: {error:#}"
-        )),
+        Err(error) => {
+            eprintln!("refused process {peer_pid}, requester unknown: {error:#}");
+            Response::Error(format!(
+                "could not identify the requesting application: {error:#}"
+            ))
+        }
     };
 
     let mut line = Zeroizing::new(serde_json::to_vec(&response)?);

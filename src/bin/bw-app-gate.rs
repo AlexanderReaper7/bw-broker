@@ -3,11 +3,13 @@ use bw_app_gate::{socket_path, Request, Response};
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
+use std::process::Command;
 use zeroize::Zeroizing;
 
 const USAGE: &str = "\
 Usage: bw-app-gate get NAME...
        bw-app-gate forget [NAME...]
+       bw-app-gate login
 
 NAME is an item name, meaning its login password, or ITEM/FIELD where FIELD is
 username, notes, totp or a custom field name. Escape '/' and '\\' in names
@@ -18,7 +20,11 @@ print a JSON object from NAME to value.
 
 forget: drops the calling application's approval for each NAME, or for all
 of its secrets when no NAME is given, so the next get prompts again. Other
-applications keep theirs.";
+applications keep theirs.
+
+login: runs `rbw login`, then `rbw lock` whatever the login did. rbw login
+leaves rbw-agent unlocked, and an unlocked rbw-agent gives any secret to any
+process of this user, around the gate.";
 
 fn request(request: &Request) -> Result<Response> {
     let mut stream = UnixStream::connect(socket_path()).with_context(|| {
@@ -75,11 +81,35 @@ fn forget(names: &[String]) -> Result<()> {
     }
 }
 
+extern "C" fn ignore_signal(_: libc::c_int) {}
+
+fn login() -> Result<()> {
+    // A handler, not SIG_IGN: exec resets handled signals to their default, so rbw login still stops on Ctrl-C, while this process lives on to lock.
+    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
+        unsafe { libc::signal(signal, ignore_signal as *const () as libc::sighandler_t) };
+    }
+    let login = Command::new("rbw").arg("login").status();
+    let lock = Command::new("rbw")
+        .arg("lock")
+        .status()
+        .context("failed to run rbw lock; run it now, rbw-agent may be unlocked")?;
+    if !lock.success() {
+        bail!("rbw lock failed ({lock}); run it now, rbw-agent may be unlocked");
+    }
+    eprintln!("rbw-agent locked");
+    let login = login.context("failed to run rbw login")?;
+    if !login.success() {
+        bail!("rbw login failed ({login})");
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.split_first() {
         Some((command, names)) if command == "get" && !names.is_empty() => get(names),
         Some((command, names)) if command == "forget" => forget(names),
+        Some((command, [])) if command == "login" => login(),
         Some((flag, [])) if flag == "-h" || flag == "--help" => {
             println!("{USAGE}");
             Ok(())
