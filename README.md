@@ -32,6 +32,19 @@ services.bw-app-gate = {
 
 After switching, run `rbw login && rbw lock`. Login leaves rbw-agent unlocked, and `rbw lock` closes that again. Do the same whenever rbw asks for a new login. Do not run `rbw unlock`: see the vault section of the decisions.
 
+## API keys
+
+One key per consumer, stored as a hidden custom field named after the consumer on the service's login item, and labelled with the same name at the provider: `openrouter.ai/t3-codex`. The reasoning is in the decisions.
+
+A program that runs a command for its token can call the client directly. For codex, `timeout_ms` has to cover the approval dialog, which waits up to 120 s; the default of 5 s is too short:
+
+```toml
+[model_providers.openrouter.auth]
+command = "/etc/profiles/per-user/alexander/bin/bw-app-gate"
+args = ["get", "openrouter.ai/t3-codex"]
+timeout_ms = 130000
+```
+
 ## Layout
 
 - `src/bin/bw-app-gate.rs` is the client.

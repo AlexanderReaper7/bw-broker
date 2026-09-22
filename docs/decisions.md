@@ -44,6 +44,16 @@ The KDF runs once per approved request, and the vault keys live only for that re
 
 `\` escapes the next character. `/`, `[` and `]` are special wherever they appear unescaped, and brackets are only valid as one trailing `[user]` on the item. Reserving them everywhere, including field names, keeps the rule one sentence long. `totp` returns the current code: the cache keeps the seed and computes the code on every read. A request that names a missing item fails as a whole and caches nothing.
 
+## API keys and tokens: one per consumer, as a hidden field on the account item
+
+Decided 2026-09-23, when the first real key (OpenRouter, for codex under T3) was set up and the user asked for a scheme to reuse for every key and token.
+
+- Each consumer gets its own key at the provider. A consumer is one program or setup that uses the key, such as `t3-codex`. Revoking one consumer then breaks nothing else, and the provider's per-key usage shows who spent what.
+- The key is a hidden custom field on the service's account login item, which is named by its domain. The field is named after the consumer, and the key's label at the provider is the same name. The gate name is `openrouter.ai/t3-codex`, or `github.com[work-user]/t3-codex` when there is more than one account.
+- A consumer can't be called `password`, `username`, `notes` or `totp`, because those built-in fields take precedence over a custom field with the same name.
+
+Rejected: one item per key, named `<domain> <consumer>`, which gives each key its own history and sharing but separates keys from the account that issued them; and several same-named items with the consumer in the username field, which fits the `[user]` qualifier but gives the username field a second meaning.
+
 Values are capped at 4096 bytes because `rbw::locked::Vec`, which keeps them in mlocked memory, is a fixed 4 KiB buffer.
 
 ## Vault copy: rbw, synced by rbw-agent as a user service
