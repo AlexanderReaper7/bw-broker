@@ -17,17 +17,21 @@ pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 /// Most secrets one request may name.
 pub const MAX_SECRETS_PER_REQUEST: usize = 64;
 
-/// One line of JSON from client to agent.
+/// One line of JSON from client to agent. Both act on the requesting instance's own cache.
 #[derive(Debug, Deserialize, Serialize)]
-pub struct Request {
-    pub secrets: Vec<String>,
+#[serde(rename_all = "snake_case")]
+pub enum Request {
+    Get(Vec<String>),
+    /// Drops the named entries, or all of the instance's entries when empty.
+    Forget(Vec<String>),
 }
 
-/// One line of JSON from agent to client. `Secrets` holds the values in the order the request named them.
+/// One line of JSON from agent to client. `Secrets` holds the values in the order the request named them. `Forgot` is how many live entries a `Forget` dropped.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Response {
     Secrets(Vec<String>),
+    Forgot(usize),
     Error(String),
 }
 

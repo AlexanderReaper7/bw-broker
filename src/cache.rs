@@ -60,6 +60,25 @@ impl Cache {
         Some(&entry.value)
     }
 
+    /// Drops the instance's entries for `secrets`, or all of them when `secrets` is empty. Returns how many live entries it dropped. Dropping zeroes the value.
+    pub fn forget(&mut self, instance: Instance, secrets: &[SecretRef], now: u64) -> usize {
+        let Some(entries) = self.instances.get_mut(&instance) else {
+            return 0;
+        };
+        let mut forgotten = 0;
+        entries.retain(|secret, entry| {
+            let keep = !secrets.is_empty() && !secrets.contains(secret);
+            if !keep && !expired(entry, now) {
+                forgotten += 1;
+            }
+            keep
+        });
+        if entries.is_empty() {
+            self.instances.remove(&instance);
+        }
+        forgotten
+    }
+
     /// Drops idle entries and every entry of an instance that is no longer alive. Dropping zeroes the value.
     pub fn sweep(&mut self, now: u64, is_alive: impl Fn(Instance) -> bool) {
         self.instances.retain(|&instance, entries| {
@@ -138,6 +157,30 @@ mod tests {
         // Read at TTL-1 reset the timer, so this read is within TTL of it.
         assert!(cache.get(A, &secret("a"), 2 * IDLE_TTL_SECS - 2).is_some());
         assert!(cache.get(A, &secret("a"), 3 * IDLE_TTL_SECS).is_none());
+    }
+
+    #[test]
+    fn forget_named_leaves_the_rest() {
+        let mut cache = Cache::default();
+        cache.insert(A, secret("a"), value("1"), 0);
+        cache.insert(A, secret("b"), value("2"), 0);
+        cache.insert(B, secret("a"), value("3"), 0);
+        assert_eq!(cache.forget(A, &[secret("a"), secret("unknown")], 1), 1);
+        assert!(cache.get(A, &secret("a"), 1).is_none());
+        assert!(cache.get(A, &secret("b"), 1).is_some());
+        assert!(cache.get(B, &secret("a"), 1).is_some());
+    }
+
+    #[test]
+    fn forget_all_is_per_instance_and_skips_expired_in_count() {
+        let mut cache = Cache::default();
+        cache.insert(A, secret("old"), value("1"), 0);
+        cache.insert(A, secret("new"), value("2"), IDLE_TTL_SECS);
+        cache.insert(B, secret("x"), value("3"), IDLE_TTL_SECS);
+        assert_eq!(cache.forget(A, &[], IDLE_TTL_SECS + 1), 1);
+        assert_eq!(cache.len(), 1);
+        assert!(cache.get(B, &secret("x"), IDLE_TTL_SECS + 1).is_some());
+        assert_eq!(cache.forget(A, &[], IDLE_TTL_SECS + 1), 0);
     }
 
     #[test]

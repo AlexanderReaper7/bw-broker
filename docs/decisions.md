@@ -26,6 +26,12 @@ The idle timer counts on `CLOCK_BOOTTIME`, which keeps running through suspend. 
 
 Screen lock and suspend do not clear the cache: agent sessions keep running while the screen is locked.
 
+## Forget: a process can drop only its own approvals (2026-09-23)
+
+`bw-app-gate forget [NAME...]` drops the calling instance's entries, the named ones or all of them, with no prompt. It exists so a program that is done with a secret, or that fetched a stale one, can give up access before it exits or goes idle. The instance is resolved the same way as for `get`, so a shell script run by a program forgets on that program's behalf.
+
+A program can not forget another program's approvals. Options considered were `--all` for every instance and `--pid N` for one other instance. Either would let any process of the user force re-prompts on every other one. That harm is small, but it is not needed: restarting `bw-app-gate-agent` already clears everything, because the cache exists only in its memory. Gating a clear-all on root was also suggested, but a root check would protect nothing that a same-user restart or kill does not already allow.
+
 ## Prompt: one dialog per request, listing only what is new
 
 The pinentry dialog names the application, its PID and the requested secrets missing from that instance's cache, and asks for the master password. Approve with the password grants all of them. Deny, or no answer in 120 seconds, refuses the whole request. Three wrong passwords fail the request. Only one dialog is open at a time, and the cache stays usable for other requesters while it is.

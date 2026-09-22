@@ -90,6 +90,35 @@ impl Agent {
         self.read_cached(requester, &secrets).await
     }
 
+    /// Drops the requester's own entries: the named ones, or all when `names` is empty. No prompt, since it only takes access away.
+    async fn forget(&self, requester: &Requester, names: &[String]) -> Result<usize> {
+        if names.len() > MAX_SECRETS_PER_REQUEST {
+            bail!("a request may name at most {MAX_SECRETS_PER_REQUEST} secrets");
+        }
+        let secrets = names
+            .iter()
+            .map(|name| SecretRef::parse(name))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(self
+            .cache
+            .lock()
+            .await
+            .forget(requester.instance, &secrets, now()))
+    }
+
+    async fn handle(&self, requester: &Requester, request: Request) -> Result<Response> {
+        Ok(match request {
+            Request::Get(names) => Response::Secrets(
+                self.serve(requester, &names)
+                    .await?
+                    .iter()
+                    .map(|value| value.to_string())
+                    .collect(),
+            ),
+            Request::Forget(names) => Response::Forgot(self.forget(requester, &names).await?),
+        })
+    }
+
     async fn read_cached(
         &self,
         requester: &Requester,
@@ -151,12 +180,10 @@ async fn handle_connection(agent: &Agent, mut stream: UnixStream) -> Result<()> 
 
     let response = match process::find_requester(peer_pid as u32) {
         Ok(requester) => match read_request(&mut stream).await {
-            Ok(request) => match agent.serve(&requester, &request.secrets).await {
-                Ok(values) => {
-                    Response::Secrets(values.iter().map(|value| value.to_string()).collect())
-                }
-                Err(error) => Response::Error(format!("{error:#}")),
-            },
+            Ok(request) => agent
+                .handle(&requester, request)
+                .await
+                .unwrap_or_else(|error| Response::Error(format!("{error:#}"))),
             Err(error) => Response::Error(format!("{error:#}")),
         },
         Err(error) => Response::Error(format!(

@@ -6,7 +6,11 @@ Programs ask for Bitwarden secrets by name. A pinentry dialog shows which progra
 bw-app-gate get github-token                  # login password, printed raw
 bw-app-gate get github-token/username npm/totp  # JSON object, name -> value
 bw-app-gate get 'test[username1]'             # the item "test" whose username is username1
+bw-app-gate forget github-token               # drop this program's approval of one secret
+bw-app-gate forget                            # drop all of this program's approvals
 ```
+
+`forget` only affects the program that runs it. To clear every program's approvals, restart the agent: `systemctl --user restart bw-app-gate-agent`.
 
 A name is `item`, `item/field`, `item[user]` or `item[user]/field`. `\` escapes `/`, `[`, `]` and `\` that are part of a name.
 
