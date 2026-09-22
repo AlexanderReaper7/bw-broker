@@ -3,48 +3,59 @@ use pinentry::PassphraseInput;
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::fs::File;
+use std::io::Read;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 use sysinfo::{Pid, System};
 use zeroize::Zeroize;
 
+pub const DEFAULT_TTL_SECS: u64 = 900;
+
+#[derive(Deserialize, Serialize)]
+pub struct GetSecretRequest {
+    pub secret_name: String,
+}
+
 #[derive(Serialize, Deserialize)]
-struct CacheEntry {
-    app_path: String,
-    secret_name: String,
-    secret_value: String,
-    expires_at: u64,
+pub struct SecretResponse {
+    pub secret_value: Option<String>,
+    pub error: Option<String>,
 }
 
-fn get_cache_path() -> PathBuf {
+pub fn socket_path() -> PathBuf {
     let uid = unsafe { libc::getuid() };
-    PathBuf::from(format!("/run/user/{uid}/bw_app_gate.json"))
+    PathBuf::from(format!("/run/user/{uid}/bw-app-gate.sock"))
 }
 
-fn get_parent_app_info() -> Result<String> {
-    let ppid = Pid::from_u32(unsafe { libc::getppid() } as u32);
+pub fn process_executable(pid: Pid) -> Result<String> {
     let mut sys = System::new();
     sys.refresh_processes();
 
-    if let Some(process) = sys.process(ppid) {
-        let exe_path = process
+    if let Some(process) = sys.process(pid) {
+        Ok(process
             .exe()
             .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_else(|| process.name().to_string());
-        Ok(exe_path)
+            .unwrap_or_else(|| process.name().to_string()))
     } else {
-        Err(anyhow!("Failed to inspect calling process"))
+        Err(anyhow!("failed to inspect process"))
     }
 }
 
-fn prompt_pinentry(app_path: &str, secret_name: &str) -> Result<String> {
-    let mut input = PassphraseInput::with_binary("pinentry-gnome3")
-        .context("Failed to initialize pinentry-gnome3")?;
+pub fn parent_executable(pid: Pid) -> Result<String> {
+    let mut sys = System::new();
+    sys.refresh_processes();
+    let process = sys
+        .process(pid)
+        .ok_or_else(|| anyhow!("failed to inspect client process"))?;
+    let parent_pid = process
+        .parent()
+        .ok_or_else(|| anyhow!("failed to inspect client parent process"))?;
+    process_executable(parent_pid)
+}
 
+pub fn prompt_pinentry(app_path: &str, secret_name: &str) -> Result<String> {
+    let mut input = PassphraseInput::with_binary("pinentry-gnome3")
+        .context("failed to initialize pinentry-gnome3")?;
     let description = format!(
         "Application '{}' requests secret '{}'",
         app_path, secret_name
@@ -56,16 +67,16 @@ fn prompt_pinentry(app_path: &str, secret_name: &str) -> Result<String> {
     input
         .interact()
         .map(|passphrase| passphrase.expose_secret().clone())
-        .map_err(|error| anyhow!("Pinentry failed: {error}"))
+        .map_err(|error| anyhow!("pinentry failed: {error}"))
 }
 
-fn session_salt() -> Result<[u8; 32]> {
+pub fn session_salt() -> Result<[u8; 32]> {
     let mut salt = [0u8; 32];
     File::open("/dev/urandom")?.read_exact(&mut salt)?;
     Ok(salt)
 }
 
-fn cache_key(salt: &[u8], app_path: &str, secret_name: &str) -> String {
+pub fn cache_key(salt: &[u8], app_path: &str, secret_name: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(salt);
     hasher.update(app_path.as_bytes());
@@ -74,7 +85,7 @@ fn cache_key(salt: &[u8], app_path: &str, secret_name: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-async fn decrypt_secret_in_process(mut password: String, secret_name: &str) -> Result<String> {
+pub async fn decrypt_secret_in_process(mut password: String, secret_name: &str) -> Result<String> {
     let cfg = rbw::config::Config::load()?;
     let email = cfg
         .email
@@ -103,7 +114,7 @@ async fn decrypt_secret_in_process(mut password: String, secret_name: &str) -> R
         &db.protected_org_keys,
     )?;
 
-    let cipher = db
+    let entry = db
         .entries
         .into_iter()
         .find(|entry| {
@@ -116,23 +127,23 @@ async fn decrypt_secret_in_process(mut password: String, secret_name: &str) -> R
                 .map(|name| name == secret_name)
                 .unwrap_or(false)
         })
-        .ok_or_else(|| anyhow!("Secret '{}' not found in vault", secret_name))?;
+        .ok_or_else(|| anyhow!("secret '{}' not found in vault", secret_name))?;
 
-    let base_key = cipher
+    let base_key = entry
         .org_id
         .as_ref()
         .and_then(|org_id| organization_keys.get(org_id))
         .unwrap_or(&master_key);
-    let password_ciphertext = match cipher.data {
+    let password_ciphertext = match entry.data {
         rbw::db::EntryData::Login { password, .. } => password,
         _ => None,
     }
-    .ok_or_else(|| anyhow!("No password entry on secret item"))?;
+    .ok_or_else(|| anyhow!("no password entry on secret item"))?;
 
-    decrypt_entry_value(&password_ciphertext, base_key, cipher.key.as_deref())
+    decrypt_entry_value(&password_ciphertext, base_key, entry.key.as_deref())
 }
 
-fn decrypt_entry_value(
+pub fn decrypt_entry_value(
     ciphertext: &str,
     base_key: &rbw::locked::Keys,
     entry_key: Option<&str>,
@@ -149,70 +160,6 @@ fn decrypt_entry_value(
     Ok(String::from_utf8(plaintext)?)
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 || matches!(args[1].as_str(), "-h" | "--help") {
-        eprintln!("Usage: bw-app-gate <secret_name> [ttl_seconds]");
-        std::process::exit(if args.len() < 2 { 1 } else { 0 });
-    }
-
-    let secret_name = &args[1];
-    let ttl_secs: u64 = args
-        .get(2)
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(900);
-    let app_path = get_parent_app_info()?;
-    let salt = session_salt()?;
-
-    let cache_key = cache_key(&salt, &app_path, secret_name);
-
-    let cache_path = get_cache_path();
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    let mut cache: HashMap<String, CacheEntry> = if cache_path.exists() {
-        File::open(&cache_path)
-            .ok()
-            .and_then(|file| serde_json::from_reader(file).ok())
-            .unwrap_or_default()
-    } else {
-        HashMap::new()
-    };
-
-    if let Some(entry) = cache.get(&cache_key) {
-        if entry.expires_at > now {
-            println!("{}", entry.secret_value);
-            return Ok(());
-        }
-    }
-
-    let password = prompt_pinentry(&app_path, secret_name)?;
-    let secret_value = decrypt_secret_in_process(password, secret_name).await?;
-
-    cache.insert(
-        cache_key,
-        CacheEntry {
-            app_path,
-            secret_name: secret_name.clone(),
-            secret_value: secret_value.clone(),
-            expires_at: now + ttl_secs,
-        },
-    );
-
-    if let Ok(mut file) = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(cache_path)
-    {
-        let _ = serde_json::to_writer(&mut file, &cache);
-        let _ = file.flush();
-    }
-
-    println!("{}", secret_value);
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,7 +174,6 @@ mod tests {
     fn cache_key_changes_with_session_salt() {
         let first = cache_key(&[1; 32], "/usr/bin/editor", "api-token");
         let second = cache_key(&[2; 32], "/usr/bin/editor", "api-token");
-
         assert_ne!(first, second);
     }
 
@@ -237,7 +183,6 @@ mod tests {
         let caller_key = cache_key(&salt, "/usr/bin/editor", "api-token");
         let other_caller_key = cache_key(&salt, "/usr/bin/browser", "api-token");
         let other_secret_key = cache_key(&salt, "/usr/bin/editor", "db-password");
-
         assert_ne!(caller_key, other_caller_key);
         assert_ne!(caller_key, other_secret_key);
     }
@@ -249,10 +194,8 @@ mod tests {
             rbw::cipherstring::CipherString::encrypt_symmetric(&base_key, b"plain secret")
                 .expect("encryption should succeed")
                 .to_string();
-
         let decrypted =
             decrypt_entry_value(&encrypted, &base_key, None).expect("decryption should succeed");
-
         assert_eq!(decrypted, "plain secret");
     }
 
@@ -276,11 +219,9 @@ mod tests {
             rbw::cipherstring::CipherString::encrypt_symmetric(&entry_key, b"entry secret")
                 .expect("value encryption should succeed")
                 .to_string();
-
         let decrypted =
             decrypt_entry_value(&encrypted_value, &base_key, Some(&encrypted_entry_key))
                 .expect("entry-key decryption should succeed");
-
         assert_eq!(decrypted, "entry secret");
     }
 }
