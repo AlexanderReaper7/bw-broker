@@ -5,7 +5,10 @@ Programs ask for Bitwarden secrets by name. A pinentry dialog shows which progra
 ```sh
 bw-app-gate get github-token                  # login password, printed raw
 bw-app-gate get github-token/username npm/totp  # JSON object, name -> value
+bw-app-gate get 'test[username1]'             # the item "test" whose username is username1
 ```
+
+A name is `item`, `item/field`, `item[user]` or `item[user]/field`. `\` escapes `/`, `[`, `]` and `\` that are part of a name.
 
 The reasoning behind every choice, including what this does not protect against, is in [docs/decisions.md](docs/decisions.md).
 
@@ -14,7 +17,7 @@ The reasoning behind every choice, including what this does not protect against,
 ```nix
 # flake inputs
 bw-app-gate = {
-  url = "github:AlexanderReaper7/bw-app-gate";
+  url = "git+https://github.com/AlexanderReaper7/bw-app-gate";
   inputs.nixpkgs.follows = "nixpkgs";
 };
 

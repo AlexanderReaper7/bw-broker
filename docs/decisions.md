@@ -36,9 +36,13 @@ The application is shown by its Nix package name without hash or version plus it
 
 The KDF runs once per approved request, and the vault keys live only for that request. A time-limited unlock, where a held key lets later prompts skip the password, is planned but not built. `vault::unlock` is the only place that would change.
 
-## Secret names: `item` or `item/field`
+## Secret names: `item[user]/field`, both qualifiers optional
 
-`item` alone means the login password. Fields are `username`, `notes`, `totp` or a custom field's name. `\` escapes `/` and `\` inside names. Two items with the same name are an error, not a guess. `totp` returns the current code: the cache keeps the seed and computes the code on every read. A request that names a missing item fails as a whole and caches nothing.
+`item` alone means the login password. Fields are `username`, `notes`, `totp` or a custom field's name. Two items with the same name are an error, not a guess.
+
+`[user]` added 2026-09-23, after the user's vault turned out to hold several items with one name, such as two logins called `test`. It picks the item whose login or identity username matches exactly. Chosen over `user@item`, because usernames are often emails and item names can contain `@`; over a third path segment `item/field/user`, which needs the field spelled out to name a user; and over Bitwarden item IDs, which callers do not know and which the prompt could not show readably. Names are encrypted in rbw's copy, so an ambiguous name is only found after the password is entered.
+
+`\` escapes the next character. `/`, `[` and `]` are special wherever they appear unescaped, and brackets are only valid as one trailing `[user]` on the item. Reserving them everywhere, including field names, keeps the rule one sentence long. `totp` returns the current code: the cache keeps the seed and computes the code on every read. A request that names a missing item fails as a whole and caches nothing.
 
 Values are capped at 4096 bytes because `rbw::locked::Vec`, which keeps them in mlocked memory, is a fixed 4 KiB buffer.
 

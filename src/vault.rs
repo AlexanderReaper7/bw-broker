@@ -130,7 +130,7 @@ impl UnlockedVault {
     }
 
     fn fetch_one(&self, secret: &SecretRef) -> Result<SecretValue> {
-        let entry = self.find_entry(&secret.item)?;
+        let entry = self.find_entry(&secret.item, secret.user.as_deref())?;
         let keys = self.entry_keys(entry)?;
         let missing = || {
             anyhow!(
@@ -158,17 +158,26 @@ impl UnlockedVault {
         })
     }
 
-    fn find_entry(&self, item: &str) -> Result<&Entry> {
+    /// The one item named `item`, narrowed to the one whose username is `user` when given.
+    fn find_entry(&self, item: &str, user: Option<&str>) -> Result<&Entry> {
         let mut matches = self.entries.iter().filter(|entry| {
-            self.entry_keys(entry)
-                .and_then(|keys| decrypt_plain(&entry.name, &keys))
-                .is_ok_and(|name| name == item)
+            self.entry_keys(entry).is_ok_and(|keys| {
+                decrypt_plain(&entry.name, &keys).is_ok_and(|name| name == item)
+                    && user.is_none_or(|user| has_username(entry, &keys, user))
+            })
         });
+        let described = match user {
+            Some(user) => format!("named '{item}' with username '{user}'"),
+            None => format!("named '{item}'"),
+        };
         let entry = matches.next().ok_or_else(|| {
-            anyhow!("no item named '{item}' in the vault copy; run `rbw sync` if it is new")
+            anyhow!("no item {described} in the vault copy; run `rbw sync` if it is new")
         })?;
         if matches.next().is_some() {
-            bail!("more than one item is named '{item}'; rename one so the name is unique");
+            match user {
+                Some(_) => bail!("more than one item is {described}; rename one so it is unique"),
+                None => bail!("more than one item is {described}; pick one with '{item}[username]' or rename one"),
+            }
         }
         Ok(entry)
     }
@@ -221,6 +230,19 @@ fn field_description(field: &Field) -> String {
         Field::Totp => "TOTP seed".into(),
         Field::Custom(name) => format!("field '{name}'"),
     }
+}
+
+/// Whether the login or identity username of `entry` is `user`. Compared in locked memory, since a username can itself be requested as a secret.
+fn has_username(entry: &Entry, keys: &locked::Keys, user: &str) -> bool {
+    let ciphertext = match &entry.data {
+        EntryData::Login { username, .. } | EntryData::Identity { username, .. } => {
+            username.as_deref()
+        }
+        _ => None,
+    };
+    ciphertext
+        .and_then(|ciphertext| decrypt_locked(ciphertext, keys).ok())
+        .is_some_and(|username| username.data() == user.as_bytes())
 }
 
 /// Decrypts non-secret metadata such as item and field names into ordinary memory.
@@ -325,6 +347,58 @@ mod tests {
             .fetch(&[SecretRef::parse("api/notes").unwrap()])
             .is_err());
         assert!(vault.fetch(&[SecretRef::parse("other").unwrap()]).is_err());
+    }
+
+    fn login(keys: &locked::Keys, name: &str, username: &str, password: &str) -> Entry {
+        Entry {
+            id: name.into(),
+            org_id: None,
+            folder: None,
+            folder_id: None,
+            name: encrypt(keys, name.as_bytes()),
+            data: EntryData::Login {
+                username: Some(encrypt(keys, username.as_bytes())),
+                password: Some(encrypt(keys, password.as_bytes())),
+                totp: None,
+                uris: vec![],
+            },
+            fields: vec![],
+            notes: None,
+            history: vec![],
+            key: None,
+            master_password_reprompt: rbw::api::CipherRepromptType::None,
+        }
+    }
+
+    #[test]
+    fn username_picks_among_same_named_items() {
+        let keys = test_keys(17);
+        let vault = UnlockedVault {
+            entries: vec![
+                login(&keys, "test", "username1", "1"),
+                login(&keys, "test", "username2", "22"),
+                login(&keys, "test", "username2", "333"),
+                login(&keys, "solo", "username1", "4444"),
+            ],
+            master_key: test_keys(17),
+            org_keys: Default::default(),
+        };
+        let fetch = |name: &str| {
+            vault
+                .fetch(&[SecretRef::parse(name).unwrap()])
+                .map(|values| values[0].reveal().unwrap().to_string())
+        };
+        assert_eq!(fetch("test[username1]").unwrap(), "1");
+        assert_eq!(fetch("solo").unwrap(), "4444");
+        assert_eq!(fetch("solo[username1]").unwrap(), "4444");
+        let ambiguous = fetch("test").unwrap_err().to_string();
+        assert!(ambiguous.contains("'test[username]'"), "{ambiguous}");
+        assert!(
+            fetch("test[username2]").is_err(),
+            "two items share username2"
+        );
+        assert!(fetch("test[nobody]").is_err());
+        assert!(fetch("solo[username2]").is_err());
     }
 
     /// RFC 6238 appendix B: seed "12345678901234567890", SHA-1, T = 59 gives 94287082, of which 6 digits are 287082.
