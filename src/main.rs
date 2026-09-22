@@ -65,6 +65,15 @@ fn session_salt() -> Result<[u8; 32]> {
     Ok(salt)
 }
 
+fn cache_key(salt: &[u8], app_path: &str, secret_name: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(salt);
+    hasher.update(app_path.as_bytes());
+    hasher.update(b":");
+    hasher.update(secret_name.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
 async fn decrypt_secret_in_process(mut password: String, secret_name: &str) -> Result<String> {
     let cfg = rbw::config::Config::load()?;
     let email = cfg
@@ -156,12 +165,7 @@ async fn main() -> Result<()> {
     let app_path = get_parent_app_info()?;
     let salt = session_salt()?;
 
-    let mut hasher = Sha256::new();
-    hasher.update(salt);
-    hasher.update(app_path.as_bytes());
-    hasher.update(b":");
-    hasher.update(secret_name.as_bytes());
-    let cache_key = hex::encode(hasher.finalize());
+    let cache_key = cache_key(&salt, &app_path, secret_name);
 
     let cache_path = get_cache_path();
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
@@ -207,4 +211,76 @@ async fn main() -> Result<()> {
 
     println!("{}", secret_value);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_keys(seed: u8) -> rbw::locked::Keys {
+        let mut key_bytes = rbw::locked::Vec::new();
+        key_bytes.extend(std::iter::repeat_n(seed, 64));
+        rbw::locked::Keys::new(key_bytes)
+    }
+
+    #[test]
+    fn cache_key_changes_with_session_salt() {
+        let first = cache_key(&[1; 32], "/usr/bin/editor", "api-token");
+        let second = cache_key(&[2; 32], "/usr/bin/editor", "api-token");
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn cache_key_binds_caller_and_secret() {
+        let salt = [7; 32];
+        let caller_key = cache_key(&salt, "/usr/bin/editor", "api-token");
+        let other_caller_key = cache_key(&salt, "/usr/bin/browser", "api-token");
+        let other_secret_key = cache_key(&salt, "/usr/bin/editor", "db-password");
+
+        assert_ne!(caller_key, other_caller_key);
+        assert_ne!(caller_key, other_secret_key);
+    }
+
+    #[test]
+    fn decrypt_entry_value_decrypts_direct_ciphertext() {
+        let base_key = test_keys(11);
+        let encrypted =
+            rbw::cipherstring::CipherString::encrypt_symmetric(&base_key, b"plain secret")
+                .expect("encryption should succeed")
+                .to_string();
+
+        let decrypted =
+            decrypt_entry_value(&encrypted, &base_key, None).expect("decryption should succeed");
+
+        assert_eq!(decrypted, "plain secret");
+    }
+
+    #[test]
+    fn decrypt_entry_value_uses_entry_key() {
+        let base_key = test_keys(13);
+        let entry_key = test_keys(29);
+        let mut entry_key_bytes = rbw::locked::Vec::new();
+        entry_key_bytes.extend(
+            entry_key
+                .enc_key()
+                .iter()
+                .chain(entry_key.mac_key())
+                .copied(),
+        );
+        let encrypted_entry_key =
+            rbw::cipherstring::CipherString::encrypt_symmetric(&base_key, entry_key_bytes.data())
+                .expect("entry key encryption should succeed")
+                .to_string();
+        let encrypted_value =
+            rbw::cipherstring::CipherString::encrypt_symmetric(&entry_key, b"entry secret")
+                .expect("value encryption should succeed")
+                .to_string();
+
+        let decrypted =
+            decrypt_entry_value(&encrypted_value, &base_key, Some(&encrypted_entry_key))
+                .expect("entry-key decryption should succeed");
+
+        assert_eq!(decrypted, "entry secret");
+    }
 }
