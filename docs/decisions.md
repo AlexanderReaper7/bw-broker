@@ -48,6 +48,8 @@ The gate reads the encrypted vault copy that rbw keeps in `~/.cache/rbw`. rbw-ag
 
 Never run `rbw unlock` on this machine: an unlocked rbw-agent hands any secret to any process of the same user through `rbw get`, around the gate.
 
+`rbw login` unlocks the agent as well, which was missed at first. Its `login_success` in rbw 1.15 syncs and then calls `rbw::actions::unlock`, keeping the keys for `lock_timeout` (3600 s by default). Found on 2026-09-22 when `rbw unlocked` exited 0 right after the first login. Decided the same day: run `rbw login && rbw lock`, every time rbw asks for a login. Setting `lock_timeout = 1` in the module was the alternative, and would close the window without anyone having to remember. The user chose the documented step instead.
+
 ## Known non-goal: cold boot attacks
 
 Cached values are mlocked and zeroed on drop, which keeps them out of swap and shortens their life, but a chilled DIMM read in another machine still shows them. Encrypting the cache in software does not help, because its key would sit in the same RAM. AMD TSME (a BIOS option) encrypts all of DRAM with a key held in the CPU and is the real defense. It costs about 10 ns of memory latency and roughly 1-2 % in normal workloads, as reported for earlier Ryzen generations. It was left off on 2026-09-22 as a consideration only.

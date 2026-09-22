@@ -27,7 +27,7 @@ services.bw-app-gate = {
 };
 ```
 
-After switching, run `rbw login` once. Do not run `rbw unlock`: see the vault section of the decisions.
+After switching, run `rbw login && rbw lock`. Login leaves rbw-agent unlocked, and `rbw lock` closes that again. Do the same whenever rbw asks for a new login. Do not run `rbw unlock`: see the vault section of the decisions.
 
 ## Layout
 
