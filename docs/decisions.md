@@ -10,9 +10,11 @@ The gate stops an application from getting a secret nobody approved for it, and 
 
 `bw-app-gate-agent` holds the cache and shows prompts. `bw-app-gate get NAME...` asks it over `/run/user/<uid>/bw-app-gate.sock` and prints to stdout. One name prints the raw value with no trailing newline, so `$(...)` gets it exactly. Several names print one JSON object. A launcher (`run -- app`) was considered and left out: under this threat model the daemon would have to trust whatever the launcher said it was starting, which is no stronger than inspecting the caller.
 
-## The requester is the nearest ancestor that is not a shell
+## The requester is the nearest ancestor that is not a shell or Python
 
 The agent walks up from the connecting process past `sh`, `bash`, `dash`, `zsh`, `fish`, `env` and the `bw-app-gate` client, and the first other process is the requester. An agent that runs `bash -c "bw-app-gate get x"` gets a new bash per call, so the direct parent would make every call a new requester and the cache useless. The walk lands on the agent process itself, so one agent session is one requester, which is also the scoping planned for later.
+
+Python interpreters are skipped too since 2026-09-23, matched as `python` followed by digits and dots, because the file name carries the version (`python3.14`). Codex ran a Python snippet per secret, and every snippet was a new process, so every one prompted. The cost is that a Python program run as an application of its own, such as a user service, is attributed to its parent and shares that instance's cache with the parent's other children. Shell scripts already had that cost.
 
 The walk reads `/proc/<pid>/exe` and fails when it cannot. It never falls back to the process name, because any process can set its own name with `prctl(PR_SET_NAME)`.
 

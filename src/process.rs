@@ -1,6 +1,6 @@
 //! Finding the requesting application from the connecting process.
 //!
-//! The requester is the nearest process, starting from the one that connected, whose executable is neither a shell nor the `bw-app-gate` client. For an agent that runs `bash -c "bw-app-gate get ..."` this lands on the agent itself, so one agent session is one instance.
+//! The requester is the nearest process, starting from the one that connected, whose executable is neither a shell, a Python interpreter nor the `bw-app-gate` client. For an agent that runs `bash -c "bw-app-gate get ..."` this lands on the agent itself, so one agent session is one instance.
 //!
 //! Everything reads `/proc` directly and fails closed: an unreadable `exe` link is an error, never a fallback to the self-reported process name.
 
@@ -10,6 +10,14 @@ use std::path::{Path, PathBuf};
 
 /// Executable file names skipped while walking up. Wrappers that only run another program belong here.
 const PASS_THROUGH: &[&str] = &["sh", "bash", "dash", "zsh", "fish", "env", "bw-app-gate"];
+
+/// Whether an executable file name is skipped while walking up: one of `PASS_THROUGH`, or a Python interpreter, `python` followed by a version of digits and dots (`python3.14`).
+fn is_pass_through(file_name: &str) -> bool {
+    PASS_THROUGH.contains(&file_name)
+        || file_name
+            .strip_prefix("python")
+            .is_some_and(|version| version.bytes().all(|byte| byte.is_ascii_digit() || byte == b'.'))
+}
 
 /// One run of a process. The start time tells a live process apart from a later one that reuses its PID.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -67,7 +75,7 @@ pub fn is_alive(instance: Instance) -> bool {
     read_stat(instance.pid).is_ok_and(|stat| stat.start_time == instance.start_time)
 }
 
-/// The nearest process from `start` upwards whose executable is not in `PASS_THROUGH`, as its instance and executable.
+/// The nearest process from `start` upwards whose executable is not pass-through, as its instance and executable.
 fn nearest_app(start: u32) -> Result<(Instance, u32, PathBuf)> {
     let mut pid = start;
     loop {
@@ -77,7 +85,7 @@ fn nearest_app(start: u32) -> Result<(Instance, u32, PathBuf)> {
         let stat = read_stat(pid)?;
         let exe = read_exe(pid)?;
         let file_name = exe.file_name().and_then(|name| name.to_str()).unwrap_or("");
-        if !PASS_THROUGH.contains(&file_name) {
+        if !is_pass_through(file_name) {
             // Read stat again after exe: if the PID was reused in between, the start time no longer matches and the request fails.
             if read_stat(pid)?.start_time != stat.start_time {
                 bail!("process {pid} changed while being inspected");
@@ -176,6 +184,16 @@ mod tests {
         assert_eq!(requester.instance.pid, std::process::id());
         assert_eq!(requester.exe, std::env::current_exe().unwrap());
         assert_eq!(requester.cwd, Some(std::env::current_dir().unwrap()));
+    }
+
+    #[test]
+    fn pass_through_includes_versioned_python_only() {
+        for name in ["bash", "env", "python", "python3", "python3.14"] {
+            assert!(is_pass_through(name), "{name}");
+        }
+        for name in ["pythonw", "python3-config", ".python3.14-wrapped", "ipython3", "claude"] {
+            assert!(!is_pass_through(name), "{name}");
+        }
     }
 
     #[test]
