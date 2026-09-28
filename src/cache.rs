@@ -9,8 +9,22 @@ use std::collections::HashMap;
 
 pub const IDLE_TTL_SECS: u64 = 15 * 60;
 
+/// What an approval allows. `Read` returns the value to the requester; `Type` only has the agent type it. A `Read` approval also covers `Type`, since a requester that has the value can type it itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Grant {
+    Read,
+    Type,
+}
+
+impl Grant {
+    fn covers(self, wanted: Grant) -> bool {
+        self == Grant::Read || wanted == Grant::Type
+    }
+}
+
 struct Entry {
     value: SecretValue,
+    grant: Grant,
     last_used: u64,
 }
 
@@ -20,14 +34,20 @@ pub struct Cache {
 }
 
 impl Cache {
-    /// The requested secrets this instance has no live entry for, in request order and without duplicates.
-    pub fn missing(&self, instance: Instance, secrets: &[SecretRef], now: u64) -> Vec<SecretRef> {
+    /// The requested secrets this instance has no live entry for that covers `grant`, in request order and without duplicates.
+    pub fn missing(
+        &self,
+        instance: Instance,
+        secrets: &[SecretRef],
+        grant: Grant,
+        now: u64,
+    ) -> Vec<SecretRef> {
         let cached = self.instances.get(&instance);
         let mut missing: Vec<SecretRef> = Vec::new();
         for secret in secrets {
             let live = cached
                 .and_then(|entries| entries.get(secret))
-                .is_some_and(|entry| !expired(entry, now));
+                .is_some_and(|entry| !expired(entry, now) && entry.grant.covers(grant));
             if !live && !missing.contains(secret) {
                 missing.push(secret.clone());
             }
@@ -35,25 +55,40 @@ impl Cache {
         missing
     }
 
-    pub fn insert(&mut self, instance: Instance, secret: SecretRef, value: SecretValue, now: u64) {
-        self.instances.entry(instance).or_default().insert(
+    /// Stores a freshly approved value. A live `Read` approval already held for the same secret is kept, so approving a `Type` never takes a `Read` away.
+    pub fn insert(
+        &mut self,
+        instance: Instance,
+        secret: SecretRef,
+        value: SecretValue,
+        grant: Grant,
+        now: u64,
+    ) {
+        let entries = self.instances.entry(instance).or_default();
+        let grant = match entries.get(&secret) {
+            Some(old) if !expired(old, now) && old.grant == Grant::Read => Grant::Read,
+            _ => grant,
+        };
+        entries.insert(
             secret,
             Entry {
                 value,
+                grant,
                 last_used: now,
             },
         );
     }
 
-    /// Reads an entry and resets its idle timer. Expired entries read as absent.
+    /// Reads an entry and resets its idle timer. Expired entries, and entries whose approval does not cover `grant`, read as absent.
     pub fn get(
         &mut self,
         instance: Instance,
         secret: &SecretRef,
+        grant: Grant,
         now: u64,
     ) -> Option<&SecretValue> {
         let entry = self.instances.get_mut(&instance)?.get_mut(secret)?;
-        if expired(entry, now) {
+        if expired(entry, now) || !entry.grant.covers(grant) {
             return None;
         }
         entry.last_used = now;
@@ -129,11 +164,11 @@ mod tests {
     #[test]
     fn entries_belong_to_one_instance() {
         let mut cache = Cache::default();
-        cache.insert(A, secret("token"), value("a"), 0);
-        assert!(cache.get(A, &secret("token"), 1).is_some());
-        assert!(cache.get(B, &secret("token"), 1).is_none());
+        cache.insert(A, secret("token"), value("a"), Grant::Read, 0);
+        assert!(cache.get(A, &secret("token"), Grant::Read, 1).is_some());
+        assert!(cache.get(B, &secret("token"), Grant::Read, 1).is_none());
         assert_eq!(
-            cache.missing(B, &[secret("token")], 1),
+            cache.missing(B, &[secret("token")], Grant::Read, 1),
             vec![secret("token")]
         );
     }
@@ -141,10 +176,10 @@ mod tests {
     #[test]
     fn missing_is_deduplicated_and_skips_cached() {
         let mut cache = Cache::default();
-        cache.insert(A, secret("a"), value("1"), 0);
+        cache.insert(A, secret("a"), value("1"), Grant::Read, 0);
         let requested = [secret("a"), secret("b"), secret("b"), secret("c")];
         assert_eq!(
-            cache.missing(A, &requested, 1),
+            cache.missing(A, &requested, Grant::Read, 1),
             vec![secret("b"), secret("c")]
         );
     }
@@ -152,45 +187,77 @@ mod tests {
     #[test]
     fn idle_timer_resets_on_read() {
         let mut cache = Cache::default();
-        cache.insert(A, secret("a"), value("1"), 0);
-        assert!(cache.get(A, &secret("a"), IDLE_TTL_SECS - 1).is_some());
+        cache.insert(A, secret("a"), value("1"), Grant::Read, 0);
+        assert!(cache
+            .get(A, &secret("a"), Grant::Read, IDLE_TTL_SECS - 1)
+            .is_some());
         // Read at TTL-1 reset the timer, so this read is within TTL of it.
-        assert!(cache.get(A, &secret("a"), 2 * IDLE_TTL_SECS - 2).is_some());
-        assert!(cache.get(A, &secret("a"), 3 * IDLE_TTL_SECS).is_none());
+        assert!(cache
+            .get(A, &secret("a"), Grant::Read, 2 * IDLE_TTL_SECS - 2)
+            .is_some());
+        assert!(cache
+            .get(A, &secret("a"), Grant::Read, 3 * IDLE_TTL_SECS)
+            .is_none());
     }
 
     #[test]
     fn forget_named_leaves_the_rest() {
         let mut cache = Cache::default();
-        cache.insert(A, secret("a"), value("1"), 0);
-        cache.insert(A, secret("b"), value("2"), 0);
-        cache.insert(B, secret("a"), value("3"), 0);
+        cache.insert(A, secret("a"), value("1"), Grant::Read, 0);
+        cache.insert(A, secret("b"), value("2"), Grant::Read, 0);
+        cache.insert(B, secret("a"), value("3"), Grant::Read, 0);
         assert_eq!(cache.forget(A, &[secret("a"), secret("unknown")], 1), 1);
-        assert!(cache.get(A, &secret("a"), 1).is_none());
-        assert!(cache.get(A, &secret("b"), 1).is_some());
-        assert!(cache.get(B, &secret("a"), 1).is_some());
+        assert!(cache.get(A, &secret("a"), Grant::Read, 1).is_none());
+        assert!(cache.get(A, &secret("b"), Grant::Read, 1).is_some());
+        assert!(cache.get(B, &secret("a"), Grant::Read, 1).is_some());
     }
 
     #[test]
     fn forget_all_is_per_instance_and_skips_expired_in_count() {
         let mut cache = Cache::default();
-        cache.insert(A, secret("old"), value("1"), 0);
-        cache.insert(A, secret("new"), value("2"), IDLE_TTL_SECS);
-        cache.insert(B, secret("x"), value("3"), IDLE_TTL_SECS);
+        cache.insert(A, secret("old"), value("1"), Grant::Read, 0);
+        cache.insert(A, secret("new"), value("2"), Grant::Read, IDLE_TTL_SECS);
+        cache.insert(B, secret("x"), value("3"), Grant::Read, IDLE_TTL_SECS);
         assert_eq!(cache.forget(A, &[], IDLE_TTL_SECS + 1), 1);
         assert_eq!(cache.len(), 1);
-        assert!(cache.get(B, &secret("x"), IDLE_TTL_SECS + 1).is_some());
+        assert!(cache
+            .get(B, &secret("x"), Grant::Read, IDLE_TTL_SECS + 1)
+            .is_some());
         assert_eq!(cache.forget(A, &[], IDLE_TTL_SECS + 1), 0);
     }
 
     #[test]
     fn sweep_drops_idle_and_dead() {
         let mut cache = Cache::default();
-        cache.insert(A, secret("old"), value("1"), 0);
-        cache.insert(A, secret("new"), value("2"), IDLE_TTL_SECS);
-        cache.insert(B, secret("x"), value("3"), IDLE_TTL_SECS);
+        cache.insert(A, secret("old"), value("1"), Grant::Read, 0);
+        cache.insert(A, secret("new"), value("2"), Grant::Read, IDLE_TTL_SECS);
+        cache.insert(B, secret("x"), value("3"), Grant::Read, IDLE_TTL_SECS);
         cache.sweep(IDLE_TTL_SECS + 1, |instance| instance == A);
         assert_eq!(cache.len(), 1);
-        assert!(cache.get(A, &secret("new"), IDLE_TTL_SECS + 1).is_some());
+        assert!(cache
+            .get(A, &secret("new"), Grant::Read, IDLE_TTL_SECS + 1)
+            .is_some());
+    }
+
+    #[test]
+    fn type_approval_does_not_allow_read() {
+        let mut cache = Cache::default();
+        cache.insert(A, secret("pw"), value("1"), Grant::Type, 0);
+        assert!(cache.get(A, &secret("pw"), Grant::Type, 1).is_some());
+        assert!(cache.get(A, &secret("pw"), Grant::Read, 1).is_none());
+        assert_eq!(
+            cache.missing(A, &[secret("pw")], Grant::Read, 1),
+            vec![secret("pw")]
+        );
+        assert!(cache.missing(A, &[secret("pw")], Grant::Type, 1).is_empty());
+    }
+
+    #[test]
+    fn read_approval_allows_type_and_survives_a_type_approval() {
+        let mut cache = Cache::default();
+        cache.insert(A, secret("pw"), value("1"), Grant::Read, 0);
+        assert!(cache.missing(A, &[secret("pw")], Grant::Type, 1).is_empty());
+        cache.insert(A, secret("pw"), value("2"), Grant::Type, 2);
+        assert!(cache.get(A, &secret("pw"), Grant::Read, 3).is_some());
     }
 }

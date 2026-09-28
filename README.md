@@ -8,7 +8,15 @@ bw-app-gate get github-token/username npm/totp  # JSON object, name -> value
 bw-app-gate get 'test[username1]'             # the item "test" whose username is username1
 bw-app-gate forget github-token               # drop this program's approval of one secret
 bw-app-gate forget                            # drop all of this program's approvals
+bw-app-gate type github-token                 # type the password into the focused password field
+bw-app-gate type --keyboard github-token      # type with a virtual keyboard, for apps without an input method
+bw-app-gate list test                         # the usernames of the items named "test"
+bw-app-gate search github work                # items whose metadata contains every word
 ```
+
+`type` prints nothing secret. Without `--keyboard` it goes through the Wayland input method, which only types into a text field that is focused and has reported itself, and a password goes only into a field that reports itself as a password field. `--keyboard` types into whatever has focus, so it checks the focused window but not the field. Both stop if focus moves to another window. Electron apps need `--enable-wayland-ime` for the input method.
+
+`list` and `search` return names, URIs and folders, never values, and prompt every time. `search` matches names, URIs, usernames, folders, custom field names and text field values. It does not match notes or hidden fields.
 
 `forget` only affects the program that runs it. To clear every program's approvals, restart the agent: `systemctl --user restart bw-app-gate-agent`.
 
@@ -58,6 +66,8 @@ timeout_ms = 130000
 - `src/process.rs` finds the requesting process.
 - `src/cache.rs` holds approved secrets per instance.
 - `src/vault.rs` unlocks rbw's vault copy and decrypts values.
+- `src/typing.rs` types into the focused window: input method, virtual keyboard, focus checks.
 - `src/prompt.rs` builds the pinentry dialog.
 - `src/secret_ref.rs` parses secret names.
+- `examples/type-probe.rs` tests typing live without the vault: `cargo run --example type-probe -- [--password|--keyboard] TEXT`.
 - `nix/` has the package and the home-manager module.

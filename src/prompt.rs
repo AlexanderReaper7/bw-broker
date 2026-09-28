@@ -1,6 +1,5 @@
 //! The pinentry dialog that asks the user to approve a request.
 
-use crate::secret_ref::SecretRef;
 use anyhow::{anyhow, Result};
 use pinentry::PassphraseInput;
 use secrecy::SecretString;
@@ -15,17 +14,21 @@ pub struct Approval<'a> {
     /// Hints from the requester that it can change itself: its working directory and the app that started it.
     pub cwd: Option<&'a str>,
     pub parent: Option<&'a str>,
-    pub secrets: &'a [SecretRef],
+    /// One line per thing asked for: a secret name, or what a `type`, `list` or `search` will do.
+    pub wants: &'a [String],
 }
 
 impl Approval<'_> {
     pub fn description(&self) -> String {
         let list: String = self
-            .secrets
+            .wants
             .iter()
-            .map(|secret| format!("\n  {secret}"))
+            .map(|want| format!("\n  {want}"))
             .collect();
-        let cwd = self.cwd.map(|cwd| format!("\nin {cwd}")).unwrap_or_default();
+        let cwd = self
+            .cwd
+            .map(|cwd| format!("\nin {cwd}"))
+            .unwrap_or_default();
         let parent = self
             .parent
             .map(|parent| format!("\nstarted by {parent}"))
@@ -65,17 +68,14 @@ mod tests {
 
     #[test]
     fn description_lists_app_pid_and_secrets() {
-        let secrets = [
-            SecretRef::parse("github-token").unwrap(),
-            SecretRef::parse("npm/notes").unwrap(),
-        ];
+        let wants = ["github-token".to_string(), "npm/notes".to_string()];
         let approval = Approval {
             pinentry: "pinentry",
             app: "claude-code/.claude-wrapped",
             pid: 42,
             cwd: Some("~/Projects/x"),
             parent: Some("nodejs-slim/node"),
-            secrets: &secrets,
+            wants: &wants,
         };
         assert_eq!(
             approval.description(),
@@ -85,14 +85,14 @@ mod tests {
 
     #[test]
     fn description_omits_unknown_hints() {
-        let secrets = [SecretRef::parse("a").unwrap()];
+        let wants = ["a".to_string()];
         let approval = Approval {
             pinentry: "pinentry",
             app: "app",
             pid: 1,
             cwd: None,
             parent: None,
-            secrets: &secrets,
+            wants: &wants,
         };
         assert_eq!(
             approval.description(),

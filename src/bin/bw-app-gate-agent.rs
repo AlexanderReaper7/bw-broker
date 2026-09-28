@@ -1,10 +1,13 @@
 use anyhow::{anyhow, bail, Context, Result};
-use bw_app_gate::cache::Cache;
+use bw_app_gate::cache::{Cache, Grant};
 use bw_app_gate::process::{self, app_label, tilde, Requester};
 use bw_app_gate::prompt::Approval;
-use bw_app_gate::secret_ref::SecretRef;
-use bw_app_gate::vault::{self, SecretValue, UnlockError};
-use bw_app_gate::{socket_path, Request, Response, MAX_REQUEST_BYTES, MAX_SECRETS_PER_REQUEST};
+use bw_app_gate::secret_ref::{Field, SecretRef};
+use bw_app_gate::typing::{self, Desktop, Window};
+use bw_app_gate::vault::{self, UnlockError, UnlockedVault};
+use bw_app_gate::{
+    socket_path, Item, Request, Response, MAX_REQUEST_BYTES, MAX_SECRETS_PER_REQUEST,
+};
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,6 +29,8 @@ struct Agent {
     cache: Mutex<Cache>,
     /// Held while a prompt is open, so only one dialog shows at a time. The cache lock is not held during the prompt.
     prompt: Mutex<()>,
+    /// Held while a `type` runs, so two values are never typed at once.
+    typing: Mutex<()>,
 }
 
 /// Seconds on `CLOCK_BOOTTIME`, which unlike `Instant` keeps counting through suspend, so an idle timer also runs out while the machine sleeps.
@@ -40,8 +45,79 @@ fn now() -> u64 {
 }
 
 impl Agent {
-    /// Returns the values in request order, and the secrets that needed approval, empty when all came from the cache.
+    /// Returns the values in request order, and the secrets that needed approval, empty when all came from the cache. `wants` turns the secrets that need approval into the prompt's lines.
     async fn serve(
+        &self,
+        requester: &Requester,
+        secrets: &[SecretRef],
+        grant: Grant,
+        wants: impl Fn(&[SecretRef]) -> Vec<String>,
+    ) -> Result<(Vec<Zeroizing<String>>, Vec<SecretRef>)> {
+        let instance = requester.instance;
+
+        if self
+            .cache
+            .lock()
+            .await
+            .missing(instance, secrets, grant, now())
+            .is_empty()
+        {
+            return Ok((
+                self.read_cached(requester, secrets, grant).await?,
+                Vec::new(),
+            ));
+        }
+
+        let _prompt = self.prompt.lock().await;
+        // Another request from the same instance may have filled the cache while this one waited for the prompt lock.
+        let missing = self
+            .cache
+            .lock()
+            .await
+            .missing(instance, secrets, grant, now());
+        if !missing.is_empty() {
+            let fetch_missing = missing.clone();
+            let values = self
+                .approve(requester, wants(&missing), move |vault| {
+                    vault.fetch(&fetch_missing)
+                })
+                .await?;
+            let mut cache = self.cache.lock().await;
+            let now = now();
+            for (secret, value) in missing.iter().cloned().zip(values) {
+                cache.insert(instance, secret, value, grant, now);
+            }
+        }
+        Ok((self.read_cached(requester, secrets, grant).await?, missing))
+    }
+
+    /// Shows the prompt for `wants` and runs `with_vault` on the vault the password unlocks. The caller holds the prompt lock.
+    async fn approve<T: Send + 'static>(
+        &self,
+        requester: &Requester,
+        wants: Vec<String>,
+        with_vault: impl FnOnce(&UnlockedVault) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let pinentry = self.pinentry.clone();
+        let app = app_label(&requester.exe);
+        let pid = requester.instance.pid;
+        let cwd = requester.cwd.as_deref().map(tilde);
+        let parent = requester.parent.as_deref().map(app_label);
+        tokio::task::spawn_blocking(move || {
+            let approval = Approval {
+                pinentry: &pinentry,
+                app: &app,
+                pid,
+                cwd: cwd.as_deref(),
+                parent: parent.as_deref(),
+                wants: &wants,
+            };
+            with_vault(&unlock(&approval)?)
+        })
+        .await?
+    }
+
+    async fn get(
         &self,
         requester: &Requester,
         names: &[String],
@@ -53,46 +129,82 @@ impl Agent {
             .iter()
             .map(|name| SecretRef::parse(name))
             .collect::<Result<Vec<_>>>()?;
-        let instance = requester.instance;
+        self.serve(requester, &secrets, Grant::Read, |missing| {
+            missing.iter().map(ToString::to_string).collect()
+        })
+        .await
+    }
 
-        if self
-            .cache
-            .lock()
-            .await
-            .missing(instance, &secrets, now())
-            .is_empty()
-        {
-            return Ok((self.read_cached(requester, &secrets).await?, Vec::new()));
-        }
-
-        let _prompt = self.prompt.lock().await;
-        // Another request from the same instance may have filled the cache while this one waited for the prompt lock.
-        let missing = self.cache.lock().await.missing(instance, &secrets, now());
-        if !missing.is_empty() {
-            let pinentry = self.pinentry.clone();
-            let app = app_label(&requester.exe);
-            let pid = instance.pid;
-            let cwd = requester.cwd.as_deref().map(tilde);
-            let parent = requester.parent.as_deref().map(app_label);
-            let fetch_missing = missing.clone();
-            let values = tokio::task::spawn_blocking(move || {
-                approve_and_fetch(&Approval {
-                    pinentry: &pinentry,
-                    app: &app,
-                    pid,
-                    cwd: cwd.as_deref(),
-                    parent: parent.as_deref(),
-                    secrets: &fetch_missing,
-                })
-            })
-            .await??;
-            let mut cache = self.cache.lock().await;
-            let now = now();
-            for (secret, value) in missing.iter().cloned().zip(values) {
-                cache.insert(instance, secret, value, now);
+    /// Types one secret into the focused field. Returns the window it went to and whether it needed approval.
+    async fn type_secret(
+        &self,
+        requester: &Requester,
+        name: &str,
+        keyboard: bool,
+    ) -> Result<(Window, bool)> {
+        let secret = SecretRef::parse(name)?;
+        let _typing = self.typing.lock().await;
+        let target = tokio::task::spawn_blocking(|| {
+            Desktop::connect()?
+                .focused()
+                .ok_or_else(|| anyhow!("no window has focus"))
+        })
+        .await??;
+        let how = if keyboard {
+            " with the keyboard, no field check"
+        } else {
+            ""
+        };
+        let (mut values, approved) = self
+            .serve(
+                requester,
+                std::slice::from_ref(&secret),
+                Grant::Type,
+                |_| vec![format!("type {secret} into {target}{how}")],
+            )
+            .await?;
+        let value = values.pop().expect("one secret was requested");
+        let password = secret.field == Field::Password;
+        let typed_into = target.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut desktop = Desktop::connect()?;
+            desktop.wait_for_focus(&typed_into, typing::FOCUS_RETURN)?;
+            if keyboard {
+                desktop.press_keys(&typed_into, value.as_bytes())
+            } else {
+                desktop.commit(&typed_into, &value, password)
             }
+        })
+        .await??;
+        Ok((target, !approved.is_empty()))
+    }
+
+    /// `list` and `search`: metadata only, approved per request and never cached.
+    async fn find_items(&self, requester: &Requester, request: &Request) -> Result<Vec<Item>> {
+        let _prompt = self.prompt.lock().await;
+        match request {
+            Request::List(item) => {
+                let item = item.clone();
+                self.approve(
+                    requester,
+                    vec![format!("the usernames of the items named '{item}'")],
+                    move |vault| Ok(vault.list(&item)),
+                )
+                .await
+            }
+            Request::Search(query) => {
+                let query = query.clone();
+                self.approve(
+                    requester,
+                    vec![format!(
+                        "a search of names, URIs, usernames, folders and text fields for '{query}'"
+                    )],
+                    move |vault| vault.search(&query),
+                )
+                .await
+            }
+            _ => unreachable!("find_items only serves list and search"),
         }
-        Ok((self.read_cached(requester, &secrets).await?, missing))
     }
 
     /// Drops the requester's own entries: the named ones, or all when `names` is empty. No prompt, since it only takes access away.
@@ -115,7 +227,7 @@ impl Agent {
     async fn handle(&self, requester: &Requester, request: Request) -> Response {
         let who = describe(requester);
         match request {
-            Request::Get(names) => match self.serve(requester, &names).await {
+            Request::Get(names) => match self.get(requester, &names).await {
                 Ok((values, approved)) => {
                     let how = if approved.is_empty() {
                         "all cached".to_string()
@@ -145,6 +257,36 @@ impl Agent {
                     Response::Error(format!("{error:#}"))
                 }
             },
+            Request::Type { name, keyboard } => {
+                match self.type_secret(requester, &name, keyboard).await {
+                    Ok((window, approved)) => {
+                        let how = if approved { "approved" } else { "cached" };
+                        eprintln!("{who} typed {name} into {window} ({how})");
+                        Response::Typed(format!("typed {name} into {window}"))
+                    }
+                    Err(error) => {
+                        eprintln!("{who} was refused typing {name}: {error:#}");
+                        Response::Error(format!("{error:#}"))
+                    }
+                }
+            }
+            Request::List(_) | Request::Search(_) => {
+                let what = match &request {
+                    Request::List(item) => format!("listed '{item}'"),
+                    Request::Search(query) => format!("searched for '{query}'"),
+                    _ => unreachable!(),
+                };
+                match self.find_items(requester, &request).await {
+                    Ok(items) => {
+                        eprintln!("{who} {what} ({} items)", items.len());
+                        Response::Items(items)
+                    }
+                    Err(error) => {
+                        eprintln!("{who} was refused, {what}: {error:#}");
+                        Response::Error(format!("{error:#}"))
+                    }
+                }
+            }
         }
     }
 
@@ -152,6 +294,7 @@ impl Agent {
         &self,
         requester: &Requester,
         secrets: &[SecretRef],
+        grant: Grant,
     ) -> Result<Vec<Zeroizing<String>>> {
         let mut cache = self.cache.lock().await;
         let now = now();
@@ -159,7 +302,7 @@ impl Agent {
             .iter()
             .map(|secret| {
                 cache
-                    .get(requester.instance, secret, now)
+                    .get(requester.instance, secret, grant, now)
                     .ok_or_else(|| {
                         anyhow!("'{secret}' expired while the request was waiting; retry")
                     })?
@@ -191,15 +334,15 @@ fn join(names: &[impl std::fmt::Display]) -> String {
         .join(", ")
 }
 
-/// Shows the prompt, unlocks the vault with the password and decrypts the secrets. Blocking: runs pinentry and the KDF.
-fn approve_and_fetch(approval: &Approval) -> Result<Vec<SecretValue>> {
+/// Shows the prompt and unlocks the vault with the password. Blocking: runs pinentry and the KDF.
+fn unlock(approval: &Approval) -> Result<UnlockedVault> {
     let mut error = None;
     for _ in 0..PASSWORD_ATTEMPTS {
         let password = approval
             .ask(error)?
             .ok_or_else(|| anyhow!("denied by the user"))?;
         match vault::unlock(&password) {
-            Ok(vault) => return vault.fetch(approval.secrets),
+            Ok(vault) => return Ok(vault),
             Err(UnlockError::WrongPassword) => error = Some("Wrong master password"),
             Err(UnlockError::Other(error)) => return Err(error),
         }
@@ -309,6 +452,7 @@ async fn main() -> Result<()> {
         pinentry,
         cache: Mutex::new(Cache::default()),
         prompt: Mutex::new(()),
+        typing: Mutex::new(()),
     });
 
     let sweeper = agent.clone();

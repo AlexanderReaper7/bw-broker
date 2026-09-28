@@ -14,9 +14,11 @@ const PASS_THROUGH: &[&str] = &["sh", "bash", "dash", "zsh", "fish", "env", "bw-
 /// Whether an executable file name is skipped while walking up: one of `PASS_THROUGH`, or a Python interpreter, `python` followed by a version of digits and dots (`python3.14`).
 fn is_pass_through(file_name: &str) -> bool {
     PASS_THROUGH.contains(&file_name)
-        || file_name
-            .strip_prefix("python")
-            .is_some_and(|version| version.bytes().all(|byte| byte.is_ascii_digit() || byte == b'.'))
+        || file_name.strip_prefix("python").is_some_and(|version| {
+            version
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b'.')
+        })
 }
 
 /// One run of a process. The start time tells a live process apart from a later one that reuses its PID.
@@ -191,7 +193,13 @@ mod tests {
         for name in ["bash", "env", "python", "python3", "python3.14"] {
             assert!(is_pass_through(name), "{name}");
         }
-        for name in ["pythonw", "python3-config", ".python3.14-wrapped", "ipython3", "claude"] {
+        for name in [
+            "pythonw",
+            "python3-config",
+            ".python3.14-wrapped",
+            "ipython3",
+            "claude",
+        ] {
             assert!(!is_pass_through(name), "{name}");
         }
     }

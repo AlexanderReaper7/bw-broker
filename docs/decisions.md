@@ -83,3 +83,41 @@ On 2026-09-23 the step became a command, `bw-app-gate login`, so it does not rel
 ## Known non-goal: cold boot attacks
 
 Cached values are mlocked and zeroed on drop, which keeps them out of swap and shortens their life, but a chilled DIMM read in another machine still shows them. Encrypting the cache in software does not help, because its key would sit in the same RAM. AMD TSME (a BIOS option) encrypts all of DRAM with a key held in the CPU and is the real defense. It costs about 10 ns of memory latency and roughly 1-2 % in normal workloads, as reported for earlier Ryzen generations. It was left off on 2026-09-22 as a consideration only.
+
+## Credential workflow for agents: type, list, search and mail-otp (2026-09-28)
+
+The user wanted an agent to be able to log in to sites and read one-time codes from Gmail without the values passing through the agent, since everything a tool prints goes to the model provider. Four requests came out of that. They share the prompt, the audit log and the per-instance cache.
+
+### `type NAME`: the agent writes the value into the focused text field
+
+The value goes from the vault to the focused field and never to the caller. The prompt names the target window by app id and title, so the user sees where it will go before approving.
+
+Delivery is a short-lived Wayland input method (`zwp_input_method_v2.commit_string`), with the virtual keyboard as an explicit fallback. It was first planned as keystrokes through the virtual keyboard with a focus check before each one, and changed the same day after a probe on this machine showed what the input method sees. When a text field gains focus, the compositor tells the input method, including the field's `content_purpose`. Firefox reported `Password` with `HiddenText | SensitiveData` for `<input type=password>` and `Normal` for a text input, and it sent `Deactivate` when a click left the field. That gives three things the keyboard does not:
+
+- A password is refused unless the focused field says it is a password field. This was first planned with AT-SPI, which needs accessibility on for the whole session and an app restart, and which lets any same-user process read the widget text of every window. The user dropped that. The input method needs neither.
+- A click that moves focus to another field, even inside the same window, arrives as `Deactivate` or a new `Activate`. The value goes in one request, and a `wl_display.sync` after it shows whether focus changed before the compositor delivered the value. If it did, the reply names the window that may have received it. The user's concern was that a stray click must not send the value somewhere else.
+- The compositor delivers text, not key codes, so the keyboard layout does not matter and any Unicode works.
+
+Apps without text-input-v3 get no `Activate`. That includes Electron apps unless they are started with `--enable-wayland-ime`: teams-for-linux 2.22 on Electron 43 sent nothing. For those, `type --keyboard` uses `zwp_virtual_keyboard_v1` with one fixed keymap of the 95 printable ASCII characters. The same keymap every time means the focused app learns nothing about which characters the value uses, which a keymap built per value would reveal; values with other characters are refused (the user's choice). In keyboard mode the check is the window only: the focused toplevel is compared with the target before every key and after the last, and typing stops at the first mismatch. Keyboard mode has no field check and cannot tell a username field from a password field.
+
+The fallback is a flag, not automatic. "No field is active" looks the same in an app without text-input-v3 and in Firefox with focus on a link or the page body, and typing a password into the page body can land in quick find. The requester decides, having looked at the screen.
+
+Known gaps. A layer-shell surface that takes the keyboard, such as the launcher, is not a toplevel and is not seen by the window check in keyboard mode; in input-method mode it sends `Deactivate`. The Wayland client library takes `commit_string`'s text as a `String` and drops it without zeroing. That copy is short-lived but is outside the rule that values stay in locked or zeroed memory.
+
+Approvals. A `type` approval is cached like a `get` approval, but it does not allow `get`: the cache records which of the two was approved, and `get` needs a `get` approval. A `get` approval allows `type`, since a caller that has the value can type it itself. A cached `type` approval is not bound to the window shown in the prompt. Binding it would mean a prompt per window for the same secret, and an honest agent types into the window it just focused.
+
+### `list ITEM` and `search QUERY`: metadata only
+
+An agent choosing among several accounts needs the usernames. Autofill picks badly when a site has more than one account or when it cannot find the fields, so `type` is the main path and the Bitwarden extension's autofill is a shortcut. `list ITEM` returns the gate name `ITEM[username]` of every item named `ITEM`. `search QUERY` returns the same for every item where each whitespace-separated word of the query appears, case-insensitive, in one of the item name, a URI, the username, the folder name, a custom field's name, or the value of a text (not hidden) custom field. Notes and hidden fields are not searched, because notes often hold secrets and a match reveals a little about the content. Results carry the URIs and the folder.
+
+Both need the master password, because names are encrypted in rbw's copy and the agent keeps no key. Results are not cached: an approval covers the one query shown in the prompt.
+
+### `mail-otp`: a code from Gmail, typed by default
+
+Reads the inbox over IMAP with a Google app password stored in the vault, and fetched through the gate like any other secret. Planned rules, not yet built:
+
+- `--from` is optional and takes several domains, because the domain that sends a code is often not the one being logged in to.
+- Without `--from` it accepts exactly one message with a code that arrives during the wait and passes DKIM, and fails on zero or two.
+- The code is the number next to words like "code" or "verification"; anything uncertain is a failure, not a guess.
+- The code is typed by default; printing it is an explicit flag. The reply names the sender domain and never includes the body.
+- Magic links are left out of the first version.

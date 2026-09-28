@@ -3,6 +3,7 @@
 //! The vault is unlocked for one request and the keys are dropped with the `UnlockedVault`. Plaintext values stay in `rbw::locked::Vec`, which is mlocked and zeroed on drop.
 
 use crate::secret_ref::{Field, SecretRef};
+use crate::Item;
 use anyhow::{anyhow, bail, Context, Result};
 use rbw::cipherstring::CipherString;
 use rbw::db::{Entry, EntryData};
@@ -158,6 +159,86 @@ impl UnlockedVault {
         })
     }
 
+    /// The items named exactly `item`.
+    pub fn list(&self, item: &str) -> Vec<Item> {
+        self.items(|metadata| metadata.name == item)
+    }
+
+    /// The items where every whitespace-separated word of `query` appears, ignoring case, in one of the searched metadata fields. See `Metadata::searched`.
+    pub fn search(&self, query: &str) -> Result<Vec<Item>> {
+        let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+        if words.is_empty() {
+            bail!("the search query is empty");
+        }
+        Ok(self.items(|metadata| {
+            let searched: Vec<String> = metadata.searched().map(str::to_lowercase).collect();
+            words
+                .iter()
+                .all(|word| searched.iter().any(|text| text.contains(word.as_str())))
+        }))
+    }
+
+    /// Items whose metadata passes `keep`, sorted by gate name. Items that fail to decrypt are skipped, as in `find_entry`.
+    fn items(&self, keep: impl Fn(&Metadata) -> bool) -> Vec<Item> {
+        let mut items: Vec<Item> = self
+            .entries
+            .iter()
+            .filter_map(|entry| self.metadata(entry).ok())
+            .filter(|metadata| keep(metadata))
+            .map(|metadata| Item {
+                name: SecretRef {
+                    item: metadata.name,
+                    user: metadata.username,
+                    field: Field::Password,
+                }
+                .to_string(),
+                uris: metadata.uris,
+                folder: metadata.folder,
+            })
+            .collect();
+        items.sort_by(|a, b| a.name.cmp(&b.name));
+        items
+    }
+
+    /// Decrypts the metadata of one entry. Notes and hidden field values are left encrypted.
+    fn metadata(&self, entry: &Entry) -> Result<Metadata> {
+        let keys = self.entry_keys(entry)?;
+        let plain = |ciphertext: Option<&str>| {
+            ciphertext
+                .map(|ciphertext| decrypt_plain(ciphertext, &keys))
+                .transpose()
+        };
+        let (username, uris) = match &entry.data {
+            EntryData::Login { username, uris, .. } => (
+                plain(username.as_deref())?,
+                uris.iter()
+                    .map(|uri| decrypt_plain(&uri.uri, &keys))
+                    .collect::<Result<_>>()?,
+            ),
+            EntryData::Identity { username, .. } => (plain(username.as_deref())?, Vec::new()),
+            _ => (None, Vec::new()),
+        };
+        let mut fields = Vec::new();
+        for field in &entry.fields {
+            fields.extend(plain(field.name.as_deref())?);
+            if field.ty == Some(rbw::api::FieldType::Text) {
+                fields.extend(plain(field.value.as_deref())?);
+            }
+        }
+        Ok(Metadata {
+            name: decrypt_plain(&entry.name, &keys)?,
+            username,
+            uris,
+            // Folder names are always encrypted with the account's own key, also on organization items.
+            folder: entry
+                .folder
+                .as_deref()
+                .map(|folder| decrypt_plain(folder, &self.master_key))
+                .transpose()?,
+            fields,
+        })
+    }
+
     /// The one item named `item`, narrowed to the one whose username is `user` when given.
     fn find_entry(&self, item: &str, user: Option<&str>) -> Result<&Entry> {
         let mut matches = self.entries.iter().filter(|entry| {
@@ -219,6 +300,27 @@ impl UnlockedVault {
             )),
             None => Ok(base.clone()),
         }
+    }
+}
+
+/// What `list` and `search` see of an item.
+struct Metadata {
+    name: String,
+    username: Option<String>,
+    uris: Vec<String>,
+    folder: Option<String>,
+    /// Custom field names, and the values of text fields. Hidden and boolean values are not included.
+    fields: Vec<String>,
+}
+
+impl Metadata {
+    /// The fields `search` matches against. Notes and hidden fields are not among them, because notes often hold secrets and a match would reveal part of one.
+    fn searched(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.name.as_str())
+            .chain(self.username.as_deref())
+            .chain(self.uris.iter().map(String::as_str))
+            .chain(self.folder.as_deref())
+            .chain(self.fields.iter().map(String::as_str))
     }
 }
 
@@ -399,6 +501,58 @@ mod tests {
         );
         assert!(fetch("test[nobody]").is_err());
         assert!(fetch("solo[username2]").is_err());
+    }
+
+    #[test]
+    fn list_and_search_see_metadata_only() {
+        let keys = test_keys(19);
+        let text = |name: &str, value: &str, ty| rbw::db::Field {
+            ty: Some(ty),
+            name: Some(encrypt(&keys, name.as_bytes())),
+            value: Some(encrypt(&keys, value.as_bytes())),
+            linked_id: None,
+        };
+        let mut work = login(&keys, "GitHub", "alice@work.example", "pw1");
+        if let EntryData::Login { uris, .. } = &mut work.data {
+            uris.push(rbw::db::Uri {
+                uri: encrypt(&keys, b"https://github.com/login"),
+                match_type: None,
+            });
+        }
+        work.folder = Some(encrypt(&keys, b"Work"));
+        work.fields = vec![
+            text("team", "platform", rbw::api::FieldType::Text),
+            text("recovery", "hiddenword", rbw::api::FieldType::Hidden),
+        ];
+        work.notes = Some(encrypt(&keys, b"notesword"));
+        let personal = login(&keys, "GitHub", "bob", "pw2");
+        let other = login(&keys, "Other/site", "carol[x]", "pw3");
+        let vault = UnlockedVault {
+            entries: vec![work, personal, other],
+            master_key: test_keys(19),
+            org_keys: Default::default(),
+        };
+        let names = |items: Vec<Item>| items.into_iter().map(|item| item.name).collect::<Vec<_>>();
+
+        assert_eq!(
+            names(vault.list("GitHub")),
+            ["GitHub[alice@work.example]", "GitHub[bob]"]
+        );
+        assert_eq!(names(vault.list("github")), Vec::<String>::new());
+        let found = vault.search("github work").unwrap();
+        assert_eq!(found[0].uris, ["https://github.com/login"]);
+        assert_eq!(found[0].folder.as_deref(), Some("Work"));
+        assert_eq!(names(found), ["GitHub[alice@work.example]"]);
+        assert_eq!(names(vault.search("PLATFORM").unwrap()).len(), 1);
+        assert_eq!(names(vault.search("recovery").unwrap()).len(), 1);
+        assert!(vault.search("hiddenword").unwrap().is_empty());
+        assert!(vault.search("notesword").unwrap().is_empty());
+        assert_eq!(names(vault.search("github").unwrap()).len(), 2);
+        assert_eq!(
+            names(vault.search("carol").unwrap()),
+            [r"Other\/site[carol\[x\]]"]
+        );
+        assert!(vault.search("  ").is_err());
     }
 
     /// RFC 6238 appendix B: seed "12345678901234567890", SHA-1, T = 59 gives 94287082, of which 6 digits are 287082.

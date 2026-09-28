@@ -1,5 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
-use bw_app_gate::{socket_path, Request, Response};
+use bw_app_gate::{socket_path, Item, Request, Response};
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -8,6 +8,9 @@ use zeroize::Zeroizing;
 
 const USAGE: &str = "\
 Usage: bw-app-gate get NAME...
+       bw-app-gate type [--keyboard] NAME
+       bw-app-gate list ITEM
+       bw-app-gate search WORD...
        bw-app-gate forget [NAME...]
        bw-app-gate login
 
@@ -17,6 +20,22 @@ with a backslash.
 
 get: one NAME prints the value exactly, with no trailing newline. Several
 print a JSON object from NAME to value.
+
+type: types the value into the focused text field of the focused window and
+prints where it went, never the value. A login password is only typed into a
+field that says it is a password field. --keyboard types key by key through a
+virtual keyboard, for apps whose fields are not reported to input methods
+(Electron without --enable-wayland-ime). It checks the window, not the field,
+and only types printable ASCII. Approving a type does not allow a get.
+
+list: prints the gate name ITEM[username] of every item named ITEM, one per
+line, followed by a tab, its URIs separated by spaces, a tab and its folder.
+
+search: the same for every item where each WORD appears, ignoring case, in its
+name, a URI, the username, the folder, a custom field name or a text custom
+field's value. Notes and hidden fields are not searched.
+
+list and search need the master password every time; nothing is cached.
 
 forget: drops the calling application's approval for each NAME, or for all
 of its secrets when no NAME is given, so the next get prompts again. Other
@@ -67,18 +86,54 @@ fn get(names: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Zeroes any values in a response that was not the expected kind, then fails.
+fn unexpected(response: Response, command: &str) -> Result<()> {
+    if let Response::Secrets(mut values) = response {
+        values.iter_mut().for_each(zeroize::Zeroize::zeroize);
+    }
+    bail!("unexpected response to {command}")
+}
+
 fn forget(names: &[String]) -> Result<()> {
     match request(&Request::Forget(names.to_vec()))? {
         Response::Forgot(count) => {
             println!("forgot {count} secret{}", if count == 1 { "" } else { "s" });
             Ok(())
         }
-        Response::Secrets(mut values) => {
-            values.iter_mut().for_each(zeroize::Zeroize::zeroize);
-            bail!("unexpected response to forget")
-        }
-        Response::Error(error) => Err(anyhow!(error)),
+        response => unexpected(response, "forget"),
     }
+}
+
+fn type_secret(name: &str, keyboard: bool) -> Result<()> {
+    match request(&Request::Type {
+        name: name.to_string(),
+        keyboard,
+    })? {
+        Response::Typed(outcome) => {
+            println!("{outcome}");
+            Ok(())
+        }
+        response => unexpected(response, "type"),
+    }
+}
+
+fn print_items(query: &Request) -> Result<()> {
+    let items: Vec<Item> = match request(query)? {
+        Response::Items(items) => items,
+        response => return unexpected(response, "list or search"),
+    };
+    if items.is_empty() {
+        bail!("no items found; run `rbw sync` if one is new");
+    }
+    for item in items {
+        println!(
+            "{}\t{}\t{}",
+            item.name,
+            item.uris.join(" "),
+            item.folder.unwrap_or_default()
+        );
+    }
+    Ok(())
 }
 
 extern "C" fn ignore_signal(_: libc::c_int) {}
@@ -109,6 +164,14 @@ fn main() -> Result<()> {
     match args.split_first() {
         Some((command, names)) if command == "get" && !names.is_empty() => get(names),
         Some((command, names)) if command == "forget" => forget(names),
+        Some((command, [name])) if command == "type" => type_secret(name, false),
+        Some((command, [flag, name])) if command == "type" && flag == "--keyboard" => {
+            type_secret(name, true)
+        }
+        Some((command, [item])) if command == "list" => print_items(&Request::List(item.clone())),
+        Some((command, words)) if command == "search" && !words.is_empty() => {
+            print_items(&Request::Search(words.join(" ")))
+        }
         Some((command, [])) if command == "login" => login(),
         Some((flag, [])) if flag == "-h" || flag == "--help" => {
             println!("{USAGE}");
