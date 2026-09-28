@@ -44,6 +44,13 @@ in
       description = "Email of the Bitwarden account, written to rbw's config.";
     };
 
+    mailLogin = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "google.com[you@gmail.com]/bw-app-gate-imap";
+      description = "Gate name of the hidden field holding a Gmail app password, for `bw-app-gate mail-otp`. The item's username is the IMAP user. null turns mail-otp off.";
+    };
+
     pinentry = lib.mkOption {
       type = lib.types.package;
       default = pkgs.pinentry-gnome3;
@@ -73,7 +80,9 @@ in
           PartOf = [ "graphical-session.target" ];
         };
         Service = {
-          ExecStart = "${lib.getExe' cfg.package "bw-app-gate-agent"} --pinentry ${lib.getExe cfg.pinentry}";
+          ExecStart =
+            "${lib.getExe' cfg.package "bw-app-gate-agent"} --pinentry ${lib.getExe cfg.pinentry}"
+            + lib.optionalString (cfg.mailLogin != null) " --mail-login ${lib.escapeShellArg cfg.mailLogin}";
           Restart = "on-failure";
           # The cache holds approved secrets in memory only. No core dumps, and
           # the process already makes itself non-dumpable.

@@ -11,6 +11,7 @@ Usage: bw-app-gate get NAME...
        bw-app-gate type [--keyboard] NAME
        bw-app-gate list ITEM
        bw-app-gate search WORD...
+       bw-app-gate mail-otp [--from DOMAIN]... [--print] [--keyboard] [--wait SECS]
        bw-app-gate forget [NAME...]
        bw-app-gate login
 
@@ -25,8 +26,8 @@ type: types the value into the focused text field of the focused window and
 prints where it went, never the value. A login password is only typed into a
 field that says it is a password field. --keyboard types key by key through a
 virtual keyboard, for apps whose fields are not reported to input methods
-(Electron without --enable-wayland-ime). It checks the window, not the field,
-and only types printable ASCII. Approving a type does not allow a get.
+(Electron apps). It checks the window, not the field, and only types printable
+ASCII. Approving a type does not allow a get.
 
 list: prints the gate name ITEM[username] of every item named ITEM, one per
 line, followed by a tab, its URIs separated by spaces, a tab and its folder.
@@ -35,7 +36,18 @@ search: the same for every item where each WORD appears, ignoring case, in its
 name, a URI, the username, the folder, a custom field name or a text custom
 field's value. Notes and hidden fields are not searched.
 
-list and search need the master password every time; nothing is cached.
+The first list or search asks for the master password; after that, the same
+application's queries only need Approve for 15 minutes of idle time.
+
+mail-otp: waits for a one-time code in the Gmail inbox and types it into the
+focused field, like type. --print prints it instead. A message counts when
+Gmail saw a passing DKIM signature aligned with its From domain, and when it
+arrived at most 2 minutes before the request. --from DOMAIN, repeatable, takes
+the newest such message from DOMAIN or its subdomains; without --from exactly
+one message with a code may arrive. The code is the one number next to a word
+like 'code'; several numbers are an error, not a guess. --wait defaults to 120
+seconds, at most 600. Prints the sender domain. Asks for the master password
+every time.
 
 forget: drops the calling application's approval for each NAME, or for all
 of its secrets when no NAME is given, so the next get prompts again. Other
@@ -88,8 +100,13 @@ fn get(names: &[String]) -> Result<()> {
 
 /// Zeroes any values in a response that was not the expected kind, then fails.
 fn unexpected(response: Response, command: &str) -> Result<()> {
-    if let Response::Secrets(mut values) = response {
-        values.iter_mut().for_each(zeroize::Zeroize::zeroize);
+    match response {
+        Response::Secrets(mut values) => values.iter_mut().for_each(zeroize::Zeroize::zeroize),
+        Response::MailCode {
+            code: Some(mut code),
+            ..
+        } => zeroize::Zeroize::zeroize(&mut code),
+        _ => {}
     }
     bail!("unexpected response to {command}")
 }
@@ -136,6 +153,64 @@ fn print_items(query: &Request) -> Result<()> {
     Ok(())
 }
 
+fn mail_otp(args: &[String]) -> Result<()> {
+    let mut from = Vec::new();
+    let mut print = false;
+    let mut keyboard = false;
+    let mut wait_secs = bw_app_gate::mail::DEFAULT_WAIT.as_secs();
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--from" => from.push(
+                args.next()
+                    .ok_or_else(|| anyhow!("--from needs a domain"))?
+                    .to_ascii_lowercase(),
+            ),
+            "--print" => print = true,
+            "--keyboard" => keyboard = true,
+            "--wait" => {
+                wait_secs = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--wait needs a number of seconds"))?
+                    .parse()
+                    .context("--wait needs a number of seconds")?
+            }
+            _ => bail!("unknown mail-otp argument '{arg}'\n\n{USAGE}"),
+        }
+    }
+    if print && keyboard {
+        bail!("--print and --keyboard do not go together");
+    }
+    match request(&Request::MailOtp {
+        from,
+        print,
+        keyboard,
+        wait_secs,
+    })? {
+        Response::MailCode {
+            sender,
+            code: Some(code),
+            ..
+        } => {
+            let code = Zeroizing::new(code);
+            eprintln!("code from {sender}");
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(code.as_bytes())?;
+            stdout.flush()?;
+            Ok(())
+        }
+        Response::MailCode {
+            sender,
+            typed_into: Some(window),
+            ..
+        } => {
+            println!("typed a code from {sender} into {window}");
+            Ok(())
+        }
+        response => unexpected(response, "mail-otp"),
+    }
+}
+
 extern "C" fn ignore_signal(_: libc::c_int) {}
 
 fn login() -> Result<()> {
@@ -172,6 +247,7 @@ fn main() -> Result<()> {
         Some((command, words)) if command == "search" && !words.is_empty() => {
             print_items(&Request::Search(words.join(" ")))
         }
+        Some((command, args)) if command == "mail-otp" => mail_otp(args),
         Some((command, [])) if command == "login" => login(),
         Some((flag, [])) if flag == "-h" || flag == "--help" => {
             println!("{USAGE}");

@@ -12,6 +12,8 @@ bw-app-gate type github-token                 # type the password into the focus
 bw-app-gate type --keyboard github-token      # type with a virtual keyboard, for apps without an input method
 bw-app-gate list test                         # the usernames of the items named "test"
 bw-app-gate search github work                # items whose metadata contains every word
+bw-app-gate mail-otp --from github.com        # wait for a code mailed by github.com and type it
+bw-app-gate mail-otp --print                  # exactly one code from any sender, printed
 ```
 
 `type` prints nothing secret. Without `--keyboard` it goes through the Wayland input method, which only types into a text field that is focused and has reported itself, and a password goes only into a field that reports itself as a password field. `--keyboard` types into whatever has focus, so it checks the focused window but not the field. Both stop if focus moves to another window. Electron apps do not work with the input method, even with `--enable-wayland-ime`, so they need `--keyboard`.
@@ -46,6 +48,8 @@ services.bw-app-gate = {
 
 After switching, run `bw-app-gate login`. It runs `rbw login` and then `rbw lock` even if the login fails or is interrupted, because login leaves rbw-agent unlocked. Do the same whenever rbw asks for a new login. Do not run `rbw unlock`: see the vault section of the decisions.
 
+`mail-otp` needs a [Google app password](https://myaccount.google.com/apppasswords) in a hidden custom field on the Google login item, and the module option `mailLogin = "google.com[you@gmail.com]/bw-app-gate-imap";` naming it.
+
 ## API keys
 
 One key per consumer, stored as a hidden custom field named after the consumer on the service's login item, and labelled with the same name at the provider: `openrouter.ai/t3-codex`. The reasoning is in the decisions.
@@ -67,7 +71,9 @@ timeout_ms = 130000
 - `src/cache.rs` holds approved secrets per instance.
 - `src/vault.rs` unlocks rbw's vault copy and decrypts values.
 - `src/typing.rs` types into the focused window: input method, virtual keyboard, focus checks.
+- `src/mail.rs` reads Gmail over IMAP and picks out one-time codes for `mail-otp`.
 - `src/prompt.rs` builds the pinentry dialog.
 - `src/secret_ref.rs` parses secret names.
 - `examples/type-probe.rs` tests typing live without the vault: `cargo run --example type-probe -- [--password|--keyboard] TEXT`.
+- `examples/mail-probe.rs` tests `mail-otp` without the agent, reading the app password from stdin.
 - `nix/` has the package and the home-manager module.

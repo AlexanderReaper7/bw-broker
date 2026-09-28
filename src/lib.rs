@@ -3,6 +3,7 @@
 //! Design decisions and their reasons live in `docs/decisions.md`.
 
 pub mod cache;
+pub mod mail;
 pub mod process;
 pub mod prompt;
 pub mod secret_ref;
@@ -34,6 +35,13 @@ pub enum Request {
     List(String),
     /// The items whose metadata contains every word of the query.
     Search(String),
+    /// Waits up to `wait_secs` for a one-time code in the mail and types it into the focused field, or returns it when `print` is set. `from` limits the sender domains; empty accepts any sender but only exactly one message with a code.
+    MailOtp {
+        from: Vec<String>,
+        print: bool,
+        keyboard: bool,
+        wait_secs: u64,
+    },
 }
 
 /// One line of JSON from agent to client. `Secrets` holds the values in the order the request named them. `Forgot` is how many live entries a `Forget` dropped. `Typed` says where a `Type` went.
@@ -44,6 +52,12 @@ pub enum Response {
     Forgot(usize),
     Typed(String),
     Items(Vec<Item>),
+    /// A `MailOtp` result: the authenticated sender domain, and the code when it was asked to print, or else where the code was typed.
+    MailCode {
+        sender: String,
+        code: Option<String>,
+        typed_into: Option<String>,
+    },
     Error(String),
 }
 

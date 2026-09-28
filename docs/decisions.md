@@ -102,7 +102,7 @@ Apps without text-input-v3 get no `Activate`. That includes Electron apps: teams
 
 The fallback is a flag, not automatic. "No field is active" looks the same in an app without text-input-v3 and in Firefox with focus on a link or the page body, and typing a password into the page body can land in quick find. The requester decides, having looked at the screen.
 
-Known gaps. A layer-shell surface that takes the keyboard, such as the launcher, is not a toplevel and is not seen by the window check in keyboard mode; in input-method mode it sends `Deactivate`. The Wayland client library takes `commit_string`'s text as a `String` and drops it without zeroing. That copy is short-lived but is outside the rule that values stay in locked or zeroed memory.
+Known gaps. A layer-shell surface that takes the keyboard, such as the launcher, is not a toplevel and is not seen by the window check in keyboard mode; in input-method mode it sends `Deactivate`. The Wayland client library takes `commit_string`'s text as a `String` and drops it without zeroing. That copy is short-lived but is outside the rule that values stay in locked or zeroed memory. Accepted by the user the same day, after measuring what it would take to read it: the machine has no swap, and the agent is non-dumpable with `LimitCORE=0`, so only root or a bug inside the agent could read the freed bytes. The same value also sits in the compositor and in the target app, which are less protected. The root fix, a global allocator in the agent that zeroes every freed block, was offered and declined. The same acceptance covers the library copies in `mail-otp`: async-imap formats the LOGIN command, app password included, into a `String`, and mail-parser decodes message bodies into plain strings.
 
 Approvals. A `type` approval is cached like a `get` approval, but it does not allow `get`: the cache records which of the two was approved, and `get` needs a `get` approval. A `get` approval allows `type`, since a caller that has the value can type it itself. A cached `type` approval is not bound to the window shown in the prompt. Binding it would mean a prompt per window for the same secret, and an honest agent types into the window it just focused.
 
@@ -114,10 +114,17 @@ The first `list` or `search` of an instance needs the master password, because n
 
 ### `mail-otp`: a code from Gmail, typed by default
 
-Reads the inbox over IMAP with a Google app password stored in the vault, and fetched through the gate like any other secret. Planned rules, not yet built:
+Reads the inbox over IMAP (`imap.gmail.com:993`, rustls with the webpki roots) with a Google app password. The password is a hidden field on the Google login item, following the API-key scheme; the agent's `--mail-login NAME` names it, and the item's username is the IMAP user. The agent reads both itself after the approval, and they never go to the requester. The inbox is opened with EXAMINE, read-only, and fetched with `BODY.PEEK`, so nothing is marked as read.
 
-- `--from` is optional and takes several domains, because the domain that sends a code is often not the one being logged in to.
-- Without `--from` it accepts exactly one message with a code that arrives during the wait and passes DKIM, and fails on zero or two.
-- The code is the number next to words like "code" or "verification"; anything uncertain is a failure, not a guess.
-- The code is typed by default; printing it is an explicit flag. The reply names the sender domain and never includes the body.
-- Magic links are left out of the first version.
+Every request needs the master password; nothing is cached (the user's choice). A cached approval would let a requester read any later code without the user seeing it.
+
+Which messages count:
+
+- Sender authentication trusts Gmail's own `Authentication-Results` header rather than checking DKIM signatures in the agent (the user's choice, 2026-09-28). Gmail is the receiving server and checked the signature at delivery with the DNS keys of that moment; a check hours later would redo it with a worse view, and fail on keys rotated since. Only the topmost `Authentication-Results` header counts, and only with authserv-id `mx.google.com`: Gmail puts its own on top, and anything below came with the message and can be written by anyone. mail-parser's `header_raw` returns the last one, so the code does not use it; a test with a forged header below Gmail's covers this.
+- The message needs a `dkim=pass` for a domain aligned with the `From` domain: one is the other or a subdomain of it. This is DMARC's relaxed alignment without the public suffix list, slightly stricter than DMARC. It stops a message signed by `attacker.example` from showing `From: github.com`, which the reply would otherwise name as the sender.
+- A message counts if it arrived at most 2 minutes before the request (`GRACE`), since the site often sends the code while the approval prompt is open, and until the wait ends (default 120 s, at most 600).
+- `--from` is optional and takes several domains, matched against the authenticated `From` domain and its subdomains, because the domain that sends a code is often not the one being logged in to. With `--from`, the newest matching message with a code wins, since a resent code replaces the old one. Without it, the first check that finds any message with a code decides: exactly one is used, two or more fail and name the senders.
+
+The code: 4 to 8 digit numbers standing alone, or two equal groups of 3 or 4 digits joined by a space or hyphen, within 150 characters after or 50 before a keyword (`code`, `kod`, `verif`, `one-time`, `bekräft`, and `otp` and `pin` as whole words). Numbers touching letters or number punctuation (prices, times, dates, `G-123456`) and 4-digit numbers starting 19 or 20 are skipped. The subject and the text bodies are searched; exactly one distinct code is required, and two or more are an error, not a guess.
+
+The code is typed by default, like `type` but into any field (no password field check); `--print` returns it instead. The reply names the sender domain and never includes the body. Magic links are left out of the first version.

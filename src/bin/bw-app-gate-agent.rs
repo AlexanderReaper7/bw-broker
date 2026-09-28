@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use bw_app_gate::cache::{Cache, Grant};
+use bw_app_gate::mail::{self, Found, Login};
 use bw_app_gate::process::{self, app_label, tilde, Requester};
 use bw_app_gate::prompt::Approval;
 use bw_app_gate::secret_ref::{Field, SecretRef};
@@ -16,7 +17,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
-const USAGE: &str = "Usage: bw-app-gate-agent [--pinentry PROGRAM]";
+const USAGE: &str = "Usage: bw-app-gate-agent [--pinentry PROGRAM] [--mail-login NAME]\n\nNAME is the hidden field holding the Gmail app password for mail-otp, on the item whose username is the Gmail address: google.com[you@gmail.com]/bw-app-gate-imap.";
 
 /// Wrong master passwords accepted in one prompt before the request fails.
 const PASSWORD_ATTEMPTS: usize = 3;
@@ -26,6 +27,8 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 struct Agent {
     pinentry: String,
+    /// Where the IMAP app password for `mail-otp` lives; the IMAP user is that item's username. `None` turns `mail-otp` off.
+    mail_login: Option<SecretRef>,
     cache: Mutex<Cache>,
     /// Held while a prompt is open, so only one dialog shows at a time. The cache lock is not held during the prompt.
     prompt: Mutex<()>,
@@ -154,12 +157,7 @@ impl Agent {
     ) -> Result<(Window, bool)> {
         let secret = SecretRef::parse(name)?;
         let _typing = self.typing.lock().await;
-        let target = tokio::task::spawn_blocking(|| {
-            Desktop::connect()?
-                .focused()
-                .ok_or_else(|| anyhow!("no window has focus"))
-        })
-        .await??;
+        let target = focused_window().await?;
         let how = if keyboard {
             " with the keyboard, no field check"
         } else {
@@ -175,18 +173,82 @@ impl Agent {
             .await?;
         let value = values.pop().expect("one secret was requested");
         let password = secret.field == Field::Password;
-        let typed_into = target.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut desktop = Desktop::connect()?;
-            desktop.wait_for_focus(&typed_into, typing::FOCUS_RETURN)?;
-            if keyboard {
-                desktop.press_keys(&typed_into, value.as_bytes())
-            } else {
-                desktop.commit(&typed_into, &value, password)
-            }
-        })
-        .await??;
+        deliver(target.clone(), value, keyboard, password).await?;
         Ok((target, !approved.is_empty()))
+    }
+
+    /// `mail-otp`: one password approval per request, never cached. Returns the code's sender and code, and the window it was typed into unless `print` asked for the code back.
+    async fn mail_otp(
+        &self,
+        requester: &Requester,
+        from: &[String],
+        print: bool,
+        keyboard: bool,
+        wait_secs: u64,
+    ) -> Result<(Found, Option<Window>)> {
+        let secret = self.mail_login.clone().ok_or_else(|| {
+            anyhow!("mail-otp is not configured; start the agent with --mail-login NAME")
+        })?;
+        let wait = Duration::from_secs(wait_secs);
+        if wait.is_zero() || wait > mail::MAX_WAIT {
+            bail!(
+                "the wait must be between 1 and {} seconds",
+                mail::MAX_WAIT.as_secs()
+            );
+        }
+        if let Some(domain) = from.iter().find(|domain| {
+            domain.is_empty() || !domain.contains('.') || domain.contains(char::is_whitespace)
+        }) {
+            bail!("'{domain}' is not a domain");
+        }
+        let since = unix_now() - mail::GRACE.as_secs() as i64;
+
+        let _typing = if print {
+            None
+        } else {
+            Some(self.typing.lock().await)
+        };
+        let target = if print {
+            None
+        } else {
+            Some(focused_window().await?)
+        };
+        let senders = if from.is_empty() {
+            "any sender, if exactly one message has a code".to_string()
+        } else {
+            from.join(", ")
+        };
+        let action = match &target {
+            Some(window) if keyboard => {
+                format!("type it into {window} with the keyboard, no field check")
+            }
+            Some(window) => format!("type it into {window}"),
+            None => "show it to the requester".to_string(),
+        };
+        let want = format!("a code from mail by {senders}, waiting {wait_secs} s; {action}");
+
+        let login = {
+            let _prompt = self.prompt.lock().await;
+            let user = SecretRef {
+                field: Field::Username,
+                ..secret.clone()
+            };
+            let secrets = vec![user, secret];
+            let values = self
+                .approve(requester, vec![want], move |vault| vault.fetch(&secrets))
+                .await?;
+            Login {
+                user: values[0].reveal()?,
+                password: values[1].reveal()?,
+            }
+        };
+        let found =
+            mail::wait_for_code(&login, from, since, std::time::Instant::now() + wait).await?;
+        drop(login);
+        if let Some(target) = &target {
+            deliver(target.clone(), found.code.clone(), keyboard, false).await?;
+        }
+        Ok((found, target))
     }
 
     /// `list` and `search`: metadata only. The first query of an instance needs the master password and caches the metadata index; later ones only need an approve/deny confirmation. Returns whether it was confirmed against the cached index.
@@ -301,6 +363,48 @@ impl Agent {
                     }
                 }
             }
+            Request::MailOtp {
+                from,
+                print,
+                keyboard,
+                wait_secs,
+            } => {
+                let senders = if from.is_empty() {
+                    "any sender".to_string()
+                } else {
+                    join(&from)
+                };
+                match self
+                    .mail_otp(requester, &from, print, keyboard, wait_secs)
+                    .await
+                {
+                    Ok((found, target)) => {
+                        let sender = found.sender.clone();
+                        match target {
+                            Some(window) => {
+                                eprintln!("{who} typed a mail code from {sender} into {window}");
+                                Response::MailCode {
+                                    sender,
+                                    code: None,
+                                    typed_into: Some(window.to_string()),
+                                }
+                            }
+                            None => {
+                                eprintln!("{who} got a mail code from {sender}");
+                                Response::MailCode {
+                                    sender,
+                                    code: Some(found.code.to_string()),
+                                    typed_into: None,
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("{who} was refused a mail code from {senders}: {error:#}");
+                        Response::Error(format!("{error:#}"))
+                    }
+                }
+            }
             Request::List(_) | Request::Search(_) => {
                 let what = match &request {
                     Request::List(item) => format!("listed '{item}'"),
@@ -342,6 +446,41 @@ impl Agent {
             })
             .collect()
     }
+}
+
+/// The focused window, which a `type` or `mail-otp` will type into.
+async fn focused_window() -> Result<Window> {
+    tokio::task::spawn_blocking(|| {
+        Desktop::connect()?
+            .focused()
+            .ok_or_else(|| anyhow!("no window has focus"))
+    })
+    .await?
+}
+
+/// Types `value` into `target` once it has focus again, through the input method or, with `keyboard`, the virtual keyboard. `password` requires a password field.
+async fn deliver(
+    target: Window,
+    value: Zeroizing<String>,
+    keyboard: bool,
+    password: bool,
+) -> Result<()> {
+    tokio::task::spawn_blocking(move || {
+        let mut desktop = Desktop::connect()?;
+        desktop.wait_for_focus(&target, typing::FOCUS_RETURN)?;
+        if keyboard {
+            desktop.press_keys(&target, value.as_bytes())
+        } else {
+            desktop.commit(&target, &value, password)
+        }
+    })
+    .await?
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs() as i64)
 }
 
 /// The requester as the audit log names it: `claude-code/.claude-wrapped (pid 42, in ~/src)`.
@@ -421,8 +560,13 @@ async fn handle_connection(agent: &Agent, mut stream: UnixStream) -> Result<()> 
     };
 
     let mut line = Zeroizing::new(serde_json::to_vec(&response)?);
-    if let Response::Secrets(mut values) = response {
-        values.iter_mut().for_each(zeroize::Zeroize::zeroize);
+    match response {
+        Response::Secrets(mut values) => values.iter_mut().for_each(zeroize::Zeroize::zeroize),
+        Response::MailCode {
+            code: Some(mut code),
+            ..
+        } => zeroize::Zeroize::zeroize(&mut code),
+        _ => {}
     }
     line.push(b'\n');
     stream.write_all(&line).await?;
@@ -462,26 +606,45 @@ fn bind_socket() -> Result<UnixListener> {
     Ok(listener)
 }
 
-fn parse_args() -> Result<String> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.as_slice() {
-        [] => Ok("pinentry".to_string()),
-        [flag, program] if flag == "--pinentry" => Ok(program.clone()),
-        [flag] if flag == "-h" || flag == "--help" => {
-            println!("{USAGE}");
-            std::process::exit(0);
+struct Args {
+    pinentry: String,
+    mail_login: Option<SecretRef>,
+}
+
+fn parse_args() -> Result<Args> {
+    let mut args = Args {
+        pinentry: "pinentry".to_string(),
+        mail_login: None,
+    };
+    let mut rest = std::env::args().skip(1);
+    while let Some(flag) = rest.next() {
+        match flag.as_str() {
+            "--pinentry" => args.pinentry = rest.next().ok_or_else(|| anyhow!("{USAGE}"))?,
+            "--mail-login" => {
+                let name = rest.next().ok_or_else(|| anyhow!("{USAGE}"))?;
+                args.mail_login = Some(SecretRef::parse(&name)?);
+            }
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                std::process::exit(0);
+            }
+            _ => bail!("{USAGE}"),
         }
-        _ => Err(anyhow!("{USAGE}")),
     }
+    Ok(args)
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     disable_tracing()?;
-    let pinentry = parse_args()?;
+    let Args {
+        pinentry,
+        mail_login,
+    } = parse_args()?;
     let listener = bind_socket()?;
     let agent = Arc::new(Agent {
         pinentry,
+        mail_login,
         cache: Mutex::new(Cache::default()),
         prompt: Mutex::new(()),
         typing: Mutex::new(()),
