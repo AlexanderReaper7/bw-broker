@@ -91,12 +91,23 @@ impl Agent {
         Ok((self.read_cached(requester, secrets, grant).await?, missing))
     }
 
-    /// Shows the prompt for `wants` and runs `with_vault` on the vault the password unlocks. The caller holds the prompt lock.
+    /// Shows the password prompt for `wants` and runs `with_vault` on the vault the password unlocks. The caller holds the prompt lock.
     async fn approve<T: Send + 'static>(
         &self,
         requester: &Requester,
         wants: Vec<String>,
         with_vault: impl FnOnce(&UnlockedVault) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        self.prompt_with(requester, wants, |approval| with_vault(&unlock(approval)?))
+            .await
+    }
+
+    /// Builds the dialog for `wants` and runs `show` on it in a blocking thread, since pinentry and the KDF block.
+    async fn prompt_with<T: Send + 'static>(
+        &self,
+        requester: &Requester,
+        wants: Vec<String>,
+        show: impl FnOnce(&Approval) -> Result<T> + Send + 'static,
     ) -> Result<T> {
         let pinentry = self.pinentry.clone();
         let app = app_label(&requester.exe);
@@ -104,15 +115,14 @@ impl Agent {
         let cwd = requester.cwd.as_deref().map(tilde);
         let parent = requester.parent.as_deref().map(app_label);
         tokio::task::spawn_blocking(move || {
-            let approval = Approval {
+            show(&Approval {
                 pinentry: &pinentry,
                 app: &app,
                 pid,
                 cwd: cwd.as_deref(),
                 parent: parent.as_deref(),
                 wants: &wants,
-            };
-            with_vault(&unlock(&approval)?)
+            })
         })
         .await?
     }
@@ -179,32 +189,53 @@ impl Agent {
         Ok((target, !approved.is_empty()))
     }
 
-    /// `list` and `search`: metadata only, approved per request and never cached.
-    async fn find_items(&self, requester: &Requester, request: &Request) -> Result<Vec<Item>> {
-        let _prompt = self.prompt.lock().await;
-        match request {
-            Request::List(item) => {
-                let item = item.clone();
-                self.approve(
-                    requester,
-                    vec![format!("the usernames of the items named '{item}'")],
-                    move |vault| Ok(vault.list(&item)),
-                )
-                .await
+    /// `list` and `search`: metadata only. The first query of an instance needs the master password and caches the metadata index; later ones only need an approve/deny confirmation. Returns whether it was confirmed against the cached index.
+    async fn find_items(
+        &self,
+        requester: &Requester,
+        request: &Request,
+    ) -> Result<(Vec<Item>, bool)> {
+        let want = match request {
+            Request::List(item) => format!("the usernames of the items named '{item}'"),
+            Request::Search(query) if query.split_whitespace().next().is_none() => {
+                bail!("the search query is empty")
             }
             Request::Search(query) => {
-                let query = query.clone();
-                self.approve(
-                    requester,
-                    vec![format!(
-                        "a search of names, URIs, usernames, folders and text fields for '{query}'"
-                    )],
-                    move |vault| vault.search(&query),
-                )
-                .await
+                format!("a search of names, URIs, usernames, folders and text fields for '{query}'")
             }
             _ => unreachable!("find_items only serves list and search"),
-        }
+        };
+        let _prompt = self.prompt.lock().await;
+        let cached = self.cache.lock().await.index(requester.instance, now());
+        let confirmed = cached.is_some();
+        let index = match cached {
+            Some(index) => {
+                if !self
+                    .prompt_with(requester, vec![want], |approval| approval.confirm())
+                    .await?
+                {
+                    bail!("denied by the user");
+                }
+                index
+            }
+            None => {
+                let index = Arc::new(
+                    self.approve(requester, vec![want], |vault| Ok(vault.index()))
+                        .await?,
+                );
+                self.cache
+                    .lock()
+                    .await
+                    .insert_index(requester.instance, index.clone(), now());
+                index
+            }
+        };
+        let items = match request {
+            Request::List(item) => index.list(item),
+            Request::Search(query) => index.search(query)?,
+            _ => unreachable!(),
+        };
+        Ok((items, confirmed))
     }
 
     /// Drops the requester's own entries: the named ones, or all when `names` is empty. No prompt, since it only takes access away.
@@ -277,8 +308,9 @@ impl Agent {
                     _ => unreachable!(),
                 };
                 match self.find_items(requester, &request).await {
-                    Ok(items) => {
-                        eprintln!("{who} {what} ({} items)", items.len());
+                    Ok((items, confirmed)) => {
+                        let how = if confirmed { "confirmed" } else { "approved" };
+                        eprintln!("{who} {what} ({} items, {how})", items.len());
                         Response::Items(items)
                     }
                     Err(error) => {

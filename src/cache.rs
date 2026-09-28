@@ -1,11 +1,12 @@
 //! Secrets approved per requesting instance.
 //!
-//! An entry is the approval itself: nothing is written to disk. It is dropped when its instance exits or after `IDLE_TTL_SECS` without being read by that instance.
+//! An entry is the approval itself: nothing is written to disk. It is dropped when its instance exits or after `IDLE_TTL_SECS` without being read by that instance. The metadata index behind `list` and `search` is kept the same way, one per instance.
 
 use crate::process::Instance;
 use crate::secret_ref::SecretRef;
-use crate::vault::SecretValue;
+use crate::vault::{Index, SecretValue};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 pub const IDLE_TTL_SECS: u64 = 15 * 60;
 
@@ -28,9 +29,15 @@ struct Entry {
     last_used: u64,
 }
 
+struct IndexEntry {
+    index: Arc<Index>,
+    last_used: u64,
+}
+
 #[derive(Default)]
 pub struct Cache {
     instances: HashMap<Instance, HashMap<SecretRef, Entry>>,
+    indexes: HashMap<Instance, IndexEntry>,
 }
 
 impl Cache {
@@ -95,12 +102,39 @@ impl Cache {
         Some(&entry.value)
     }
 
-    /// Drops the instance's entries for `secrets`, or all of them when `secrets` is empty. Returns how many live entries it dropped. Dropping zeroes the value.
+    /// The instance's metadata index, if it has a live one. Resets its idle timer.
+    pub fn index(&mut self, instance: Instance, now: u64) -> Option<Arc<Index>> {
+        let entry = self.indexes.get_mut(&instance)?;
+        if now.saturating_sub(entry.last_used) >= IDLE_TTL_SECS {
+            return None;
+        }
+        entry.last_used = now;
+        Some(entry.index.clone())
+    }
+
+    pub fn insert_index(&mut self, instance: Instance, index: Arc<Index>, now: u64) {
+        self.indexes.insert(
+            instance,
+            IndexEntry {
+                index,
+                last_used: now,
+            },
+        );
+    }
+
+    /// Drops the instance's entries for `secrets`, or all of them and its metadata index when `secrets` is empty. Returns how many live entries it dropped, counting the index as one. Dropping zeroes the value.
     pub fn forget(&mut self, instance: Instance, secrets: &[SecretRef], now: u64) -> usize {
-        let Some(entries) = self.instances.get_mut(&instance) else {
-            return 0;
-        };
         let mut forgotten = 0;
+        if secrets.is_empty() {
+            if let Some(entry) = self.indexes.remove(&instance) {
+                if now.saturating_sub(entry.last_used) < IDLE_TTL_SECS {
+                    forgotten += 1;
+                }
+            }
+        }
+        let Some(entries) = self.instances.get_mut(&instance) else {
+            return forgotten;
+        };
         entries.retain(|secret, entry| {
             let keep = !secrets.is_empty() && !secrets.contains(secret);
             if !keep && !expired(entry, now) {
@@ -123,8 +157,12 @@ impl Cache {
             entries.retain(|_, entry| !expired(entry, now));
             !entries.is_empty()
         });
+        self.indexes.retain(|&instance, entry| {
+            is_alive(instance) && now.saturating_sub(entry.last_used) < IDLE_TTL_SECS
+        });
     }
 
+    /// The number of cached secrets, not counting metadata indexes.
     pub fn len(&self) -> usize {
         self.instances.values().map(HashMap::len).sum()
     }
@@ -259,5 +297,29 @@ mod tests {
         assert!(cache.missing(A, &[secret("pw")], Grant::Type, 1).is_empty());
         cache.insert(A, secret("pw"), value("2"), Grant::Type, 2);
         assert!(cache.get(A, &secret("pw"), Grant::Read, 3).is_some());
+    }
+
+    #[test]
+    fn index_is_per_instance_and_expires() {
+        let mut cache = Cache::default();
+        cache.insert_index(A, Arc::new(Index::default()), 0);
+        assert!(cache.index(B, 1).is_none());
+        assert!(cache.index(A, IDLE_TTL_SECS - 1).is_some());
+        assert!(cache.index(A, 2 * IDLE_TTL_SECS - 2).is_some());
+        assert!(cache.index(A, 3 * IDLE_TTL_SECS).is_none());
+        cache.insert_index(B, Arc::new(Index::default()), 0);
+        cache.sweep(1, |instance| instance == A);
+        assert!(cache.index(B, 1).is_none());
+    }
+
+    #[test]
+    fn forget_all_drops_the_index_and_forget_named_keeps_it() {
+        let mut cache = Cache::default();
+        cache.insert_index(A, Arc::new(Index::default()), 0);
+        cache.insert(A, secret("a"), value("1"), Grant::Read, 0);
+        assert_eq!(cache.forget(A, &[secret("a")], 1), 1);
+        assert!(cache.index(A, 1).is_some());
+        assert_eq!(cache.forget(A, &[], 1), 1);
+        assert!(cache.index(A, 1).is_none());
     }
 }

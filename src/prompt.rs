@@ -1,7 +1,7 @@
 //! The pinentry dialog that asks the user to approve a request.
 
 use anyhow::{anyhow, Result};
-use pinentry::PassphraseInput;
+use pinentry::{ConfirmationDialog, PassphraseInput};
 use secrecy::SecretString;
 
 /// Seconds before an unanswered prompt counts as a denial.
@@ -18,8 +18,12 @@ pub struct Approval<'a> {
     pub wants: &'a [String],
 }
 
+const ASK_PASSWORD: &str = "Enter the master password to approve.";
+const ASK_CONFIRM: &str = "Approve?";
+
 impl Approval<'_> {
-    pub fn description(&self) -> String {
+    /// The dialog text, ending in `closing`: `ASK_PASSWORD` or `ASK_CONFIRM`.
+    pub fn description(&self, closing: &str) -> String {
         let list: String = self
             .wants
             .iter()
@@ -34,14 +38,14 @@ impl Approval<'_> {
             .map(|parent| format!("\nstarted by {parent}"))
             .unwrap_or_default();
         format!(
-            "{} (pid {}){cwd}{parent}\nwants:{list}\n\nEnter the master password to approve.",
+            "{} (pid {}){cwd}{parent}\nwants:{list}\n\n{closing}",
             self.app, self.pid
         )
     }
 
     /// Shows the dialog. `Ok(None)` means the user cancelled or let it time out. `error` is shown above the input, for a retry after a wrong password.
     pub fn ask(&self, error: Option<&str>) -> Result<Option<SecretString>> {
-        let description = self.description();
+        let description = self.description(ASK_PASSWORD);
         let mut input = PassphraseInput::with_binary(self.pinentry)
             .ok_or_else(|| anyhow!("pinentry program '{}' not found", self.pinentry))?;
         input
@@ -57,6 +61,23 @@ impl Approval<'_> {
         match input.interact() {
             Ok(password) => Ok(Some(password)),
             Err(pinentry::Error::Cancelled | pinentry::Error::Timeout) => Ok(None),
+            Err(error) => Err(anyhow!("pinentry failed: {error}")),
+        }
+    }
+
+    /// Shows an approve/deny dialog with no password, for requests covered by an earlier password approval. `Ok(false)` means the user denied it or let it time out.
+    pub fn confirm(&self) -> Result<bool> {
+        let description = self.description(ASK_CONFIRM);
+        let mut dialog = ConfirmationDialog::with_binary(self.pinentry)
+            .ok_or_else(|| anyhow!("pinentry program '{}' not found", self.pinentry))?;
+        dialog
+            .with_title("bw-app-gate")
+            .with_ok("Approve")
+            .with_cancel("Deny")
+            .with_timeout(TIMEOUT_SECS);
+        match dialog.confirm(&description) {
+            Ok(approved) => Ok(approved),
+            Err(pinentry::Error::Cancelled | pinentry::Error::Timeout) => Ok(false),
             Err(error) => Err(anyhow!("pinentry failed: {error}")),
         }
     }
@@ -78,7 +99,7 @@ mod tests {
             wants: &wants,
         };
         assert_eq!(
-            approval.description(),
+            approval.description(ASK_PASSWORD),
             "claude-code/.claude-wrapped (pid 42)\nin ~/Projects/x\nstarted by nodejs-slim/node\nwants:\n  github-token\n  npm/notes\n\nEnter the master password to approve."
         );
     }
@@ -95,7 +116,7 @@ mod tests {
             wants: &wants,
         };
         assert_eq!(
-            approval.description(),
+            approval.description(ASK_PASSWORD),
             "app (pid 1)\nwants:\n  a\n\nEnter the master password to approve."
         );
     }

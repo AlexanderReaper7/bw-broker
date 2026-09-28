@@ -9,7 +9,7 @@ use rbw::cipherstring::CipherString;
 use rbw::db::{Entry, EntryData};
 use rbw::locked;
 use secrecy::{ExposeSecret, SecretString};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Capacity of `rbw::locked::Vec`. It is a fixed-size buffer and panics past this.
 const LOCKED_CAPACITY: usize = 4096;
@@ -159,45 +159,14 @@ impl UnlockedVault {
         })
     }
 
-    /// The items named exactly `item`.
-    pub fn list(&self, item: &str) -> Vec<Item> {
-        self.items(|metadata| metadata.name == item)
-    }
-
-    /// The items where every whitespace-separated word of `query` appears, ignoring case, in one of the searched metadata fields. See `Metadata::searched`.
-    pub fn search(&self, query: &str) -> Result<Vec<Item>> {
-        let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
-        if words.is_empty() {
-            bail!("the search query is empty");
-        }
-        Ok(self.items(|metadata| {
-            let searched: Vec<String> = metadata.searched().map(str::to_lowercase).collect();
-            words
+    /// The metadata of every item, for `list` and `search`. Items that fail to decrypt are left out, as in `find_entry`.
+    pub fn index(&self) -> Index {
+        Index(
+            self.entries
                 .iter()
-                .all(|word| searched.iter().any(|text| text.contains(word.as_str())))
-        }))
-    }
-
-    /// Items whose metadata passes `keep`, sorted by gate name. Items that fail to decrypt are skipped, as in `find_entry`.
-    fn items(&self, keep: impl Fn(&Metadata) -> bool) -> Vec<Item> {
-        let mut items: Vec<Item> = self
-            .entries
-            .iter()
-            .filter_map(|entry| self.metadata(entry).ok())
-            .filter(|metadata| keep(metadata))
-            .map(|metadata| Item {
-                name: SecretRef {
-                    item: metadata.name,
-                    user: metadata.username,
-                    field: Field::Password,
-                }
-                .to_string(),
-                uris: metadata.uris,
-                folder: metadata.folder,
-            })
-            .collect();
-        items.sort_by(|a, b| a.name.cmp(&b.name));
-        items
+                .filter_map(|entry| self.metadata(entry).ok())
+                .collect(),
+        )
     }
 
     /// Decrypts the metadata of one entry. Notes and hidden field values are left encrypted.
@@ -303,7 +272,53 @@ impl UnlockedVault {
     }
 }
 
-/// What `list` and `search` see of an item.
+/// The decrypted metadata of every item: what `list` and `search` read. The agent keeps one per instance after a password approval, so later queries only need a confirmation. It holds no values: notes and hidden fields stay encrypted in the vault copy.
+#[derive(Default)]
+pub struct Index(Vec<Metadata>);
+
+impl Index {
+    /// The items named exactly `item`.
+    pub fn list(&self, item: &str) -> Vec<Item> {
+        self.items(|metadata| metadata.name == item)
+    }
+
+    /// The items where every whitespace-separated word of `query` appears, ignoring case, in one of the searched metadata fields. See `Metadata::searched`.
+    pub fn search(&self, query: &str) -> Result<Vec<Item>> {
+        let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+        if words.is_empty() {
+            bail!("the search query is empty");
+        }
+        Ok(self.items(|metadata| {
+            let searched: Vec<String> = metadata.searched().map(str::to_lowercase).collect();
+            words
+                .iter()
+                .all(|word| searched.iter().any(|text| text.contains(word.as_str())))
+        }))
+    }
+
+    /// Items whose metadata passes `keep`, sorted by gate name.
+    fn items(&self, keep: impl Fn(&Metadata) -> bool) -> Vec<Item> {
+        let mut items: Vec<Item> = self
+            .0
+            .iter()
+            .filter(|metadata| keep(metadata))
+            .map(|metadata| Item {
+                name: SecretRef {
+                    item: metadata.name.clone(),
+                    user: metadata.username.clone(),
+                    field: Field::Password,
+                }
+                .to_string(),
+                uris: metadata.uris.clone(),
+                folder: metadata.folder.clone(),
+            })
+            .collect();
+        items.sort_by(|a, b| a.name.cmp(&b.name));
+        items
+    }
+}
+
+/// What `list` and `search` see of an item. Zeroed on drop, since the agent keeps it for up to `cache::IDLE_TTL_SECS` of idle time.
 struct Metadata {
     name: String,
     username: Option<String>,
@@ -311,6 +326,16 @@ struct Metadata {
     folder: Option<String>,
     /// Custom field names, and the values of text fields. Hidden and boolean values are not included.
     fields: Vec<String>,
+}
+
+impl Drop for Metadata {
+    fn drop(&mut self) {
+        self.name.zeroize();
+        self.username.zeroize();
+        self.uris.zeroize();
+        self.folder.zeroize();
+        self.fields.zeroize();
+    }
 }
 
 impl Metadata {
@@ -532,27 +557,28 @@ mod tests {
             master_key: test_keys(19),
             org_keys: Default::default(),
         };
+        let index = vault.index();
         let names = |items: Vec<Item>| items.into_iter().map(|item| item.name).collect::<Vec<_>>();
 
         assert_eq!(
-            names(vault.list("GitHub")),
+            names(index.list("GitHub")),
             ["GitHub[alice@work.example]", "GitHub[bob]"]
         );
-        assert_eq!(names(vault.list("github")), Vec::<String>::new());
-        let found = vault.search("github work").unwrap();
+        assert_eq!(names(index.list("github")), Vec::<String>::new());
+        let found = index.search("github work").unwrap();
         assert_eq!(found[0].uris, ["https://github.com/login"]);
         assert_eq!(found[0].folder.as_deref(), Some("Work"));
         assert_eq!(names(found), ["GitHub[alice@work.example]"]);
-        assert_eq!(names(vault.search("PLATFORM").unwrap()).len(), 1);
-        assert_eq!(names(vault.search("recovery").unwrap()).len(), 1);
-        assert!(vault.search("hiddenword").unwrap().is_empty());
-        assert!(vault.search("notesword").unwrap().is_empty());
-        assert_eq!(names(vault.search("github").unwrap()).len(), 2);
+        assert_eq!(names(index.search("PLATFORM").unwrap()).len(), 1);
+        assert_eq!(names(index.search("recovery").unwrap()).len(), 1);
+        assert!(index.search("hiddenword").unwrap().is_empty());
+        assert!(index.search("notesword").unwrap().is_empty());
+        assert_eq!(names(index.search("github").unwrap()).len(), 2);
         assert_eq!(
-            names(vault.search("carol").unwrap()),
+            names(index.search("carol").unwrap()),
             [r"Other\/site[carol\[x\]]"]
         );
-        assert!(vault.search("  ").is_err());
+        assert!(index.search("  ").is_err());
     }
 
     /// RFC 6238 appendix B: seed "12345678901234567890", SHA-1, T = 59 gives 94287082, of which 6 digits are 287082.

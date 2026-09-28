@@ -14,9 +14,9 @@ bw-app-gate list test                         # the usernames of the items named
 bw-app-gate search github work                # items whose metadata contains every word
 ```
 
-`type` prints nothing secret. Without `--keyboard` it goes through the Wayland input method, which only types into a text field that is focused and has reported itself, and a password goes only into a field that reports itself as a password field. `--keyboard` types into whatever has focus, so it checks the focused window but not the field. Both stop if focus moves to another window. Electron apps need `--enable-wayland-ime` for the input method.
+`type` prints nothing secret. Without `--keyboard` it goes through the Wayland input method, which only types into a text field that is focused and has reported itself, and a password goes only into a field that reports itself as a password field. `--keyboard` types into whatever has focus, so it checks the focused window but not the field. Both stop if focus moves to another window. Electron apps do not work with the input method, even with `--enable-wayland-ime`, so they need `--keyboard`.
 
-`list` and `search` return names, URIs and folders, never values, and prompt every time. `search` matches names, URIs, usernames, folders, custom field names and text field values. It does not match notes or hidden fields.
+`list` and `search` return names, URIs and folders, never values. The first one a program runs asks for the master password; after that its queries show an approve/deny dialog for 15 minutes of idle time. `search` matches names, URIs, usernames, folders, custom field names and text field values. It does not match notes or hidden fields.
 
 `forget` only affects the program that runs it. To clear every program's approvals, restart the agent: `systemctl --user restart bw-app-gate-agent`.
 
