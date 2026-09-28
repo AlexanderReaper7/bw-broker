@@ -295,15 +295,29 @@ fn extract_code(text: &str) -> Extracted {
         })
     };
 
-    let mut codes: Vec<Zeroizing<String>> = Vec::new();
+    // A number with nothing else on its line is how mails lay out a code; ZIP codes, order numbers and prices sit inside sentences.
+    let alone = |start: usize, end: usize| {
+        let line_start = lower[..start].rfind('\n').map_or(0, |i| i + 1);
+        let line_end = lower[end..].find('\n').map_or(lower.len(), |i| end + i);
+        lower[line_start..start].trim().is_empty() && lower[end..line_end].trim().is_empty()
+    };
+    let mut codes: Vec<(Zeroizing<String>, bool)> = Vec::new();
     for (start, end, code) in numbers(lower) {
-        if near(start, end) && !codes.iter().any(|known| **known == *code) {
-            codes.push(code);
+        if !near(start, end) {
+            continue;
         }
+        let is_alone = alone(start, end);
+        match codes.iter_mut().find(|(known, _)| **known == *code) {
+            Some((_, known_alone)) => *known_alone |= is_alone,
+            None => codes.push((code, is_alone)),
+        }
+    }
+    if codes.len() > 1 && codes.iter().filter(|(_, alone)| *alone).count() == 1 {
+        codes.retain(|(_, alone)| *alone);
     }
     match codes.len() {
         0 => Extracted::None,
-        1 => Extracted::One(codes.pop().expect("one code")),
+        1 => Extracted::One(codes.pop().expect("one code").0),
         n => Extracted::Ambiguous(n),
     }
 }
@@ -347,6 +361,10 @@ fn numbers(text: &str) -> Vec<(usize, usize, Zeroizing<String>)> {
         !before.is_some_and(bad_before) && !after.is_some_and(bad_after)
     };
 
+    // A link's query or path is not a code, even when it sits next to "code": `?LinkId=521839`, `/verify?code=123456`.
+    let urls = url_spans(text);
+    runs.retain(|&(start, _)| !urls.iter().any(|&(from, to)| from <= start && start < to));
+
     let mut found = Vec::new();
     let mut run = 0;
     while run < runs.len() {
@@ -377,6 +395,20 @@ fn numbers(text: &str) -> Vec<(usize, usize, Zeroizing<String>)> {
         run += 1;
     }
     found
+}
+
+/// Byte ranges of the links in `text`: from `http://`, `https://` or `www.` up to the next whitespace. `text` is lowercase.
+fn url_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    for prefix in ["http://", "https://", "www."] {
+        for (start, _) in text.match_indices(prefix) {
+            let end = text[start..]
+                .find(char::is_whitespace)
+                .map_or(text.len(), |length| start + length);
+            spans.push((start, end));
+        }
+    }
+    spans
 }
 
 /// The standalone check for a joined pair, on its outer edges only.
@@ -474,6 +506,42 @@ mod tests {
         // The same code in the subject and the body is one code.
         assert_eq!(
             extract_code("483920 is your code\nYour code is 483920"),
+            one("483920")
+        );
+    }
+
+    /// Microsoft's Entra guest-account mail, 2026-09-28, with the digits replaced. The footer's LinkId and ZIP code came within reach of "request a code" and made it ambiguous.
+    #[test]
+    fn numbers_in_urls_and_sentences_lose_to_a_code_on_its_own_line() {
+        let mail = "Your Lexicon account verification code\n\
+            To access Lexicon's apps and resources, please use the code below for account verification. The code will only work for 30 minutes.\n\
+            Account verification code:\n\
+            48392017\n\
+            \r\n\r\n                If you didn't request a code, you can ignore this email.\n\
+            \nPrivacy Statement: https://go.microsoft.com/fwlink/?LinkId=521839\n\
+            Microsoft Corporation, One Microsoft Way, Redmond, WA 98052";
+        assert_eq!(extract_code(mail), one("48392017"));
+        assert_eq!(
+            extract_code("Your code: 483920 (https://example.com/verify?code=111222)"),
+            one("483920")
+        );
+    }
+
+    #[test]
+    fn own_line_only_breaks_a_tie_it_can_break() {
+        // Two numbers alone on their lines stay ambiguous.
+        assert_eq!(
+            extract_code("Your code:\n111111\nBackup code:\n222222\n"),
+            Extracted::Ambiguous(2)
+        );
+        // Neither alone: ambiguous as before.
+        assert_eq!(
+            extract_code("Code 111111 or code 222222"),
+            Extracted::Ambiguous(2)
+        );
+        // A code inside a sentence still counts when it is the only one.
+        assert_eq!(
+            extract_code("Your code is 483920 for 10 minutes"),
             one("483920")
         );
     }

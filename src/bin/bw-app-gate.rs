@@ -39,14 +39,15 @@ field's value. Notes and hidden fields are not searched.
 The first list or search asks for the master password; after that, the same
 application's queries only need Approve for 15 minutes of idle time.
 
-mail-otp: waits for a one-time code in the Gmail inbox of ADDRESS and types
-it into the focused field, like type. ADDRESS is the username of the Google
-login item that holds the inbox's app password. --print prints it instead. A message counts when
-Gmail saw a passing DKIM signature aligned with its From domain, and when it
-arrived at most 2 minutes before the request. --from DOMAIN, repeatable, takes
-the newest such message from DOMAIN or its subdomains; without --from exactly
-one message with a code may arrive. The code is the one number next to a word
-like 'code'; several numbers are an error, not a guess. --wait defaults to 120
+mail-otp: waits for a one-time code in the Gmail inbox of ADDRESS and types it
+into the focused field, like type. ADDRESS is the username of the Google login
+item that holds the inbox's app password. --print prints it instead. A message
+counts when Gmail saw a passing DKIM signature aligned with its From domain,
+and when it arrived at most 2 minutes before the request. --from DOMAIN,
+repeatable, takes the newest such message from DOMAIN or its subdomains;
+without --from exactly one message with a code may arrive. The code is the one
+number next to a word like 'code', or among several the only one alone on its
+line; anything less clear is an error, not a guess. --wait defaults to 120
 seconds, at most 600. Prints the sender domain. Asks for the master password
 every time.
 
