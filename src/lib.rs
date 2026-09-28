@@ -26,23 +26,30 @@ pub enum Request {
     Get(Vec<String>),
     /// Drops the named entries, or all of the instance's entries when empty.
     Forget(Vec<String>),
-    /// Types one secret into the focused text field. `keyboard` uses the virtual keyboard instead of the input method, for apps without text-input-v3.
+    /// Types one secret into the focused text field. `keyboard` uses the virtual keyboard instead of the input method, for apps without text-input-v3. `into` refuses, before any prompt, unless the focused window's title or app id contains it, ignoring case.
     Type {
         name: String,
         keyboard: bool,
+        #[serde(default)]
+        into: Option<String>,
     },
     /// The items with exactly this name.
     List(String),
     /// The items whose metadata contains every word of the query.
     Search(String),
-    /// Waits up to `wait_secs` for a one-time code in the inbox of `to` and types it into the focused field, or returns it when `print` is set. `from` limits the sender domains; empty accepts any sender but only exactly one message with a code.
-    MailOtp {
-        to: String,
-        from: Vec<String>,
-        print: bool,
-        keyboard: bool,
-        wait_secs: u64,
-    },
+    MailOtp(MailOtp),
+}
+
+/// Waits up to `wait_secs` for a one-time code in the inbox of `to` and types it into the focused field, or returns it when `print` is set. `from` limits the sender domains; empty accepts any sender but only exactly one message with a code. `into` is as for `Type`.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct MailOtp {
+    pub to: String,
+    pub from: Vec<String>,
+    pub print: bool,
+    pub keyboard: bool,
+    pub wait_secs: u64,
+    #[serde(default)]
+    pub into: Option<String>,
 }
 
 /// One line of JSON from agent to client. `Secrets` holds the values in the order the request named them. `Forgot` is how many live entries a `Forget` dropped. `Typed` says where a `Type` went.

@@ -7,7 +7,7 @@ use bw_app_gate::secret_ref::{Field, SecretRef};
 use bw_app_gate::typing::{self, Desktop, Window};
 use bw_app_gate::vault::{self, UnlockError, UnlockedVault};
 use bw_app_gate::{
-    socket_path, Item, Request, Response, MAX_REQUEST_BYTES, MAX_SECRETS_PER_REQUEST,
+    socket_path, Item, MailOtp, Request, Response, MAX_REQUEST_BYTES, MAX_SECRETS_PER_REQUEST,
 };
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
@@ -154,10 +154,11 @@ impl Agent {
         requester: &Requester,
         name: &str,
         keyboard: bool,
+        into: Option<&str>,
     ) -> Result<(Window, bool)> {
         let secret = SecretRef::parse(name)?;
         let _typing = self.typing.lock().await;
-        let target = focused_window().await?;
+        let target = focused_window(into).await?;
         let how = if keyboard {
             " with the keyboard, no field check"
         } else {
@@ -181,12 +182,17 @@ impl Agent {
     async fn mail_otp(
         &self,
         requester: &Requester,
-        to: &str,
-        from: &[String],
-        print: bool,
-        keyboard: bool,
-        wait_secs: u64,
+        request: &MailOtp,
     ) -> Result<(Found, Option<Window>)> {
+        let MailOtp {
+            to,
+            from,
+            print,
+            keyboard,
+            wait_secs,
+            into,
+        } = request;
+        let (print, keyboard, wait_secs) = (*print, *keyboard, *wait_secs);
         let secret = SecretRef {
             user: Some(to.to_string()),
             ..self.mail_login.clone().ok_or_else(|| {
@@ -208,6 +214,9 @@ impl Agent {
         }) {
             bail!("'{domain}' is not a domain");
         }
+        if print && into.is_some() {
+            bail!("a printed code is not typed, so it has no window to match");
+        }
         let since = unix_now() - mail::GRACE.as_secs() as i64;
 
         let _typing = if print {
@@ -218,7 +227,7 @@ impl Agent {
         let target = if print {
             None
         } else {
-            Some(focused_window().await?)
+            Some(focused_window(into.as_deref()).await?)
         };
         let senders = if from.is_empty() {
             "any sender, if exactly one message has a code".to_string()
@@ -354,8 +363,15 @@ impl Agent {
                     Response::Error(format!("{error:#}"))
                 }
             },
-            Request::Type { name, keyboard } => {
-                match self.type_secret(requester, &name, keyboard).await {
+            Request::Type {
+                name,
+                keyboard,
+                into,
+            } => {
+                match self
+                    .type_secret(requester, &name, keyboard, into.as_deref())
+                    .await
+                {
                     Ok((window, approved)) => {
                         let how = if approved { "approved" } else { "cached" };
                         eprintln!("{who} typed {name} into {window} ({how})");
@@ -367,22 +383,14 @@ impl Agent {
                     }
                 }
             }
-            Request::MailOtp {
-                to,
-                from,
-                print,
-                keyboard,
-                wait_secs,
-            } => {
-                let senders = if from.is_empty() {
+            Request::MailOtp(mail_otp) => {
+                let to = &mail_otp.to;
+                let senders = if mail_otp.from.is_empty() {
                     "any sender".to_string()
                 } else {
-                    join(&from)
+                    join(&mail_otp.from)
                 };
-                match self
-                    .mail_otp(requester, &to, &from, print, keyboard, wait_secs)
-                    .await
-                {
+                match self.mail_otp(requester, &mail_otp).await {
                     Ok((found, target)) => {
                         let sender = found.sender.clone();
                         match target {
@@ -457,14 +465,20 @@ impl Agent {
     }
 }
 
-/// The focused window, which a `type` or `mail-otp` will type into.
-async fn focused_window() -> Result<Window> {
-    tokio::task::spawn_blocking(|| {
+/// The focused window, which a `type` or `mail-otp` will type into. With `into`, it has to match, or the request fails before the prompt.
+async fn focused_window(into: Option<&str>) -> Result<Window> {
+    let window = tokio::task::spawn_blocking(|| {
         Desktop::connect()?
             .focused()
             .ok_or_else(|| anyhow!("no window has focus"))
     })
-    .await?
+    .await??;
+    match into {
+        Some(needle) if !window.matches(needle) => {
+            bail!("the focused window is {window}, which does not match '{needle}'; nothing was asked or typed")
+        }
+        _ => Ok(window),
+    }
 }
 
 /// Types `value` into `target` once it has focus again, through the input method or, with `keyboard`, the virtual keyboard. `password` requires a password field.

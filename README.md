@@ -10,13 +10,14 @@ bw-app-gate forget github-token               # drop this program's approval of 
 bw-app-gate forget                            # drop all of this program's approvals
 bw-app-gate type github-token                 # type the password into the focused password field
 bw-app-gate type --keyboard github-token      # type with a virtual keyboard, for apps without an input method
+bw-app-gate type --into Teams github-token    # refuse unless the focused window's title or app id contains 'Teams'
 bw-app-gate list test                         # the usernames of the items named "test"
 bw-app-gate search github work                # items whose metadata contains every word
 bw-app-gate mail-otp --to you@gmail.com --from github.com   # wait for a code mailed by github.com and type it
 bw-app-gate mail-otp --to you@gmail.com --print             # exactly one code from any sender, printed
 ```
 
-`type` prints nothing secret. Without `--keyboard` it goes through the Wayland input method, which only types into a text field that is focused and has reported itself, and a password goes only into a field that reports itself as a password field. `--keyboard` types into whatever has focus, so it checks the focused window but not the field. Both stop if focus moves to another window. Electron apps do not work with the input method, even with `--enable-wayland-ime`, so they need `--keyboard`.
+`type` prints nothing secret. Without `--keyboard` it goes through the Wayland input method, which only types into a text field that is focused and has reported itself, and a password goes only into a field that reports itself as a password field. `--keyboard` types into whatever has focus, so it checks the focused window but not the field. Both stop if focus moves to another window. Electron apps do not work with the input method, even with `--enable-wayland-ime`, so they need `--keyboard`. `--into WINDOW` on `type` and `mail-otp` refuses before the prompt when the focused window does not match, so a value meant for one app does not go to whatever the user clicked last.
 
 `list` and `search` return names, URIs and folders, never values. The first one a program runs asks for the master password; after that its queries show an approve/deny dialog for 15 minutes of idle time. `search` matches names, URIs, usernames, folders, custom field names and text field values. It does not match notes or hidden fields.
 

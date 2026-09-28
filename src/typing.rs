@@ -157,6 +157,14 @@ pub struct Window {
     pub title: String,
 }
 
+impl Window {
+    /// Whether the title or the app id contains `needle`, ignoring case. The same rule as `computer-use activate --title`, so one string names the window for both.
+    pub fn matches(&self, needle: &str) -> bool {
+        let needle = needle.to_lowercase();
+        self.title.to_lowercase().contains(&needle) || self.app_id.to_lowercase().contains(&needle)
+    }
+}
+
 impl fmt::Display for Window {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} \"{}\"", self.app_id, self.title)
@@ -616,5 +624,18 @@ mod tests {
         }
         assert_eq!(KEYSYMS[usize::from(b'@' - 0x20)], "at");
         assert_eq!(KEYSYMS[usize::from(b'~' - 0x20)], "asciitilde");
+    }
+
+    #[test]
+    fn a_window_matches_part_of_its_title_or_app_id_in_any_case() {
+        let teams = Window {
+            identifier: "1".to_string(),
+            app_id: "teams-for-linux".to_string(),
+            title: "Sign in to your account".to_string(),
+        };
+        assert!(teams.matches("Teams"));
+        assert!(teams.matches("sign in"));
+        assert!(!teams.matches("T3 Code"));
+        assert!(!teams.matches("teams-for-linux Sign"));
     }
 }

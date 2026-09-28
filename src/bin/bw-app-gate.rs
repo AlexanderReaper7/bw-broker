@@ -1,5 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
-use bw_app_gate::{socket_path, Item, Request, Response};
+use bw_app_gate::{socket_path, Item, MailOtp, Request, Response};
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -8,10 +8,11 @@ use zeroize::Zeroizing;
 
 const USAGE: &str = "\
 Usage: bw-app-gate get NAME...
-       bw-app-gate type [--keyboard] NAME
+       bw-app-gate type [--keyboard] [--into WINDOW] NAME
        bw-app-gate list ITEM
        bw-app-gate search WORD...
-       bw-app-gate mail-otp --to ADDRESS [--from DOMAIN]... [--print] [--keyboard] [--wait SECS]
+       bw-app-gate mail-otp --to ADDRESS [--from DOMAIN]... [--print | --keyboard]
+                            [--into WINDOW] [--wait SECS]
        bw-app-gate forget [NAME...]
        bw-app-gate login
 
@@ -27,7 +28,9 @@ prints where it went, never the value. A login password is only typed into a
 field that says it is a password field. --keyboard types key by key through a
 virtual keyboard, for apps whose fields are not reported to input methods
 (Electron apps). It checks the window, not the field, and only types printable
-ASCII. Approving a type does not allow a get.
+ASCII. --into WINDOW refuses, before asking, unless the focused window's title
+or app id contains WINDOW, ignoring case. Approving a type does not allow a
+get.
 
 list: prints the gate name ITEM[username] of every item named ITEM, one per
 line, followed by a tab, its URIs separated by spaces, a tab and its folder.
@@ -40,7 +43,7 @@ The first list or search asks for the master password; after that, the same
 application's queries only need Approve for 15 minutes of idle time.
 
 mail-otp: waits for a one-time code in the Gmail inbox of ADDRESS and types it
-into the focused field, like type. ADDRESS is the username of the Google login
+into the focused field, like type, --into included. ADDRESS is the username of the Google login
 item that holds the inbox's app password. --print prints it instead. A message
 counts when Gmail saw a passing DKIM signature aligned with its From domain,
 and when it arrived at most 2 minutes before the request. --from DOMAIN,
@@ -123,10 +126,32 @@ fn forget(names: &[String]) -> Result<()> {
     }
 }
 
-fn type_secret(name: &str, keyboard: bool) -> Result<()> {
+/// The value of `--into`, which needs one.
+fn into_arg<'a>(args: &mut impl Iterator<Item = &'a String>) -> Result<Option<String>> {
+    match args.next() {
+        Some(needle) if !needle.is_empty() => Ok(Some(needle.clone())),
+        _ => bail!("--into needs part of a window title or app id"),
+    }
+}
+
+fn type_secret(args: &[String]) -> Result<()> {
+    let mut keyboard = false;
+    let mut into = None;
+    let mut name = None;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--keyboard" => keyboard = true,
+            "--into" => into = into_arg(&mut args)?,
+            _ if name.is_none() => name = Some(arg.clone()),
+            _ => bail!("type takes one NAME\n\n{USAGE}"),
+        }
+    }
+    let name = name.ok_or_else(|| anyhow!("type needs a NAME\n\n{USAGE}"))?;
     match request(&Request::Type {
-        name: name.to_string(),
+        name,
         keyboard,
+        into,
     })? {
         Response::Typed(outcome) => {
             println!("{outcome}");
@@ -160,6 +185,7 @@ fn mail_otp(args: &[String]) -> Result<()> {
     let mut from = Vec::new();
     let mut print = false;
     let mut keyboard = false;
+    let mut into = None;
     let mut wait_secs = bw_app_gate::mail::DEFAULT_WAIT.as_secs();
     let mut args = args.iter();
     while let Some(arg) = args.next() {
@@ -178,6 +204,7 @@ fn mail_otp(args: &[String]) -> Result<()> {
             }
             "--print" => print = true,
             "--keyboard" => keyboard = true,
+            "--into" => into = into_arg(&mut args)?,
             "--wait" => {
                 wait_secs = args
                     .next()
@@ -192,13 +219,17 @@ fn mail_otp(args: &[String]) -> Result<()> {
     if print && keyboard {
         bail!("--print and --keyboard do not go together");
     }
-    match request(&Request::MailOtp {
+    if print && into.is_some() {
+        bail!("--print and --into do not go together");
+    }
+    match request(&Request::MailOtp(MailOtp {
         to,
         from,
         print,
         keyboard,
         wait_secs,
-    })? {
+        into,
+    }))? {
         Response::MailCode {
             sender,
             code: Some(code),
@@ -251,10 +282,7 @@ fn main() -> Result<()> {
     match args.split_first() {
         Some((command, names)) if command == "get" && !names.is_empty() => get(names),
         Some((command, names)) if command == "forget" => forget(names),
-        Some((command, [name])) if command == "type" => type_secret(name, false),
-        Some((command, [flag, name])) if command == "type" && flag == "--keyboard" => {
-            type_secret(name, true)
-        }
+        Some((command, args)) if command == "type" && !args.is_empty() => type_secret(args),
         Some((command, [item])) if command == "list" => print_items(&Request::List(item.clone())),
         Some((command, words)) if command == "search" && !words.is_empty() => {
             print_items(&Request::Search(words.join(" ")))
