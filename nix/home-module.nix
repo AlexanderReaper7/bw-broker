@@ -47,8 +47,8 @@ in
     mailLogin = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
       default = null;
-      example = "google.com[you@gmail.com]/bw-app-gate-imap";
-      description = "Gate name of the hidden field holding a Gmail app password, for `bw-app-gate mail-otp`. The item's username is the IMAP user. null turns mail-otp off.";
+      example = "google.com/bw-app-gate-imap";
+      description = "Gate name, without [user], of the hidden field holding a Gmail app password, for `bw-app-gate mail-otp`. `mail-otp --to ADDRESS` reads the field on the item whose username is ADDRESS, and ADDRESS is the IMAP user. null turns mail-otp off.";
     };
 
     pinentry = lib.mkOption {

@@ -12,8 +12,8 @@ bw-app-gate type github-token                 # type the password into the focus
 bw-app-gate type --keyboard github-token      # type with a virtual keyboard, for apps without an input method
 bw-app-gate list test                         # the usernames of the items named "test"
 bw-app-gate search github work                # items whose metadata contains every word
-bw-app-gate mail-otp --from github.com        # wait for a code mailed by github.com and type it
-bw-app-gate mail-otp --print                  # exactly one code from any sender, printed
+bw-app-gate mail-otp --to you@gmail.com --from github.com   # wait for a code mailed by github.com and type it
+bw-app-gate mail-otp --to you@gmail.com --print             # exactly one code from any sender, printed
 ```
 
 `type` prints nothing secret. Without `--keyboard` it goes through the Wayland input method, which only types into a text field that is focused and has reported itself, and a password goes only into a field that reports itself as a password field. `--keyboard` types into whatever has focus, so it checks the focused window but not the field. Both stop if focus moves to another window. Electron apps do not work with the input method, even with `--enable-wayland-ime`, so they need `--keyboard`.
@@ -48,7 +48,7 @@ services.bw-app-gate = {
 
 After switching, run `bw-app-gate login`. It runs `rbw login` and then `rbw lock` even if the login fails or is interrupted, because login leaves rbw-agent unlocked. Do the same whenever rbw asks for a new login. Do not run `rbw unlock`: see the vault section of the decisions.
 
-`mail-otp` needs a [Google app password](https://myaccount.google.com/apppasswords) in a hidden custom field on the Google login item, and the module option `mailLogin = "google.com[you@gmail.com]/bw-app-gate-imap";` naming it.
+`mail-otp` needs a [Google app password](https://myaccount.google.com/apppasswords) in a hidden custom field on each Google login item whose inbox it may read, the same field name on every one, and the module option `mailLogin = "google.com/bw-app-gate-imap";` naming it without `[user]`. `--to ADDRESS` picks the item whose username is ADDRESS.
 
 ## API keys
 

@@ -11,7 +11,7 @@ Usage: bw-app-gate get NAME...
        bw-app-gate type [--keyboard] NAME
        bw-app-gate list ITEM
        bw-app-gate search WORD...
-       bw-app-gate mail-otp [--from DOMAIN]... [--print] [--keyboard] [--wait SECS]
+       bw-app-gate mail-otp --to ADDRESS [--from DOMAIN]... [--print] [--keyboard] [--wait SECS]
        bw-app-gate forget [NAME...]
        bw-app-gate login
 
@@ -39,8 +39,9 @@ field's value. Notes and hidden fields are not searched.
 The first list or search asks for the master password; after that, the same
 application's queries only need Approve for 15 minutes of idle time.
 
-mail-otp: waits for a one-time code in the Gmail inbox and types it into the
-focused field, like type. --print prints it instead. A message counts when
+mail-otp: waits for a one-time code in the Gmail inbox of ADDRESS and types
+it into the focused field, like type. ADDRESS is the username of the Google
+login item that holds the inbox's app password. --print prints it instead. A message counts when
 Gmail saw a passing DKIM signature aligned with its From domain, and when it
 arrived at most 2 minutes before the request. --from DOMAIN, repeatable, takes
 the newest such message from DOMAIN or its subdomains; without --from exactly
@@ -154,6 +155,7 @@ fn print_items(query: &Request) -> Result<()> {
 }
 
 fn mail_otp(args: &[String]) -> Result<()> {
+    let mut to = None;
     let mut from = Vec::new();
     let mut print = false;
     let mut keyboard = false;
@@ -166,6 +168,13 @@ fn mail_otp(args: &[String]) -> Result<()> {
                     .ok_or_else(|| anyhow!("--from needs a domain"))?
                     .to_ascii_lowercase(),
             ),
+            "--to" => {
+                to = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow!("--to needs a mail address"))?
+                        .clone(),
+                )
+            }
             "--print" => print = true,
             "--keyboard" => keyboard = true,
             "--wait" => {
@@ -178,10 +187,12 @@ fn mail_otp(args: &[String]) -> Result<()> {
             _ => bail!("unknown mail-otp argument '{arg}'\n\n{USAGE}"),
         }
     }
+    let to = to.ok_or_else(|| anyhow!("mail-otp needs --to ADDRESS, the inbox to read"))?;
     if print && keyboard {
         bail!("--print and --keyboard do not go together");
     }
     match request(&Request::MailOtp {
+        to,
         from,
         print,
         keyboard,

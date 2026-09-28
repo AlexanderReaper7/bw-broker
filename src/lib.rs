@@ -35,8 +35,9 @@ pub enum Request {
     List(String),
     /// The items whose metadata contains every word of the query.
     Search(String),
-    /// Waits up to `wait_secs` for a one-time code in the mail and types it into the focused field, or returns it when `print` is set. `from` limits the sender domains; empty accepts any sender but only exactly one message with a code.
+    /// Waits up to `wait_secs` for a one-time code in the inbox of `to` and types it into the focused field, or returns it when `print` is set. `from` limits the sender domains; empty accepts any sender but only exactly one message with a code.
     MailOtp {
+        to: String,
         from: Vec<String>,
         print: bool,
         keyboard: bool,

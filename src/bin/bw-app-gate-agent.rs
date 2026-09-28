@@ -17,7 +17,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
-const USAGE: &str = "Usage: bw-app-gate-agent [--pinentry PROGRAM] [--mail-login NAME]\n\nNAME is the hidden field holding the Gmail app password for mail-otp, on the item whose username is the Gmail address: google.com[you@gmail.com]/bw-app-gate-imap.";
+const USAGE: &str = "Usage: bw-app-gate-agent [--pinentry PROGRAM] [--mail-login NAME]\n\nNAME is the hidden field holding the Gmail app password for mail-otp, without [user]: google.com/bw-app-gate-imap. Each mail-otp request names the inbox with --to, which picks the item whose username is that address.";
 
 /// Wrong master passwords accepted in one prompt before the request fails.
 const PASSWORD_ATTEMPTS: usize = 3;
@@ -27,7 +27,7 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 struct Agent {
     pinentry: String,
-    /// Where the IMAP app password for `mail-otp` lives; the IMAP user is that item's username. `None` turns `mail-otp` off.
+    /// Where the IMAP app passwords for `mail-otp` live, without `[user]`: a request's `to` address fills it in and is the IMAP user. `None` turns `mail-otp` off.
     mail_login: Option<SecretRef>,
     cache: Mutex<Cache>,
     /// Held while a prompt is open, so only one dialog shows at a time. The cache lock is not held during the prompt.
@@ -181,14 +181,21 @@ impl Agent {
     async fn mail_otp(
         &self,
         requester: &Requester,
+        to: &str,
         from: &[String],
         print: bool,
         keyboard: bool,
         wait_secs: u64,
     ) -> Result<(Found, Option<Window>)> {
-        let secret = self.mail_login.clone().ok_or_else(|| {
-            anyhow!("mail-otp is not configured; start the agent with --mail-login NAME")
-        })?;
+        let secret = SecretRef {
+            user: Some(to.to_string()),
+            ..self.mail_login.clone().ok_or_else(|| {
+                anyhow!("mail-otp is not configured; start the agent with --mail-login NAME")
+            })?
+        };
+        if to.contains(char::is_whitespace) || to.split('@').count() != 2 {
+            bail!("'{to}' is not a mail address");
+        }
         let wait = Duration::from_secs(wait_secs);
         if wait.is_zero() || wait > mail::MAX_WAIT {
             bail!(
@@ -225,21 +232,18 @@ impl Agent {
             Some(window) => format!("type it into {window}"),
             None => "show it to the requester".to_string(),
         };
-        let want = format!("a code from mail by {senders}, waiting {wait_secs} s; {action}");
+        let want =
+            format!("a code from mail to {to} by {senders}, waiting {wait_secs} s; {action}");
 
         let login = {
             let _prompt = self.prompt.lock().await;
-            let user = SecretRef {
-                field: Field::Username,
-                ..secret.clone()
-            };
-            let secrets = vec![user, secret];
+            let secrets = vec![secret];
             let values = self
                 .approve(requester, vec![want], move |vault| vault.fetch(&secrets))
                 .await?;
             Login {
-                user: values[0].reveal()?,
-                password: values[1].reveal()?,
+                user: Zeroizing::new(to.to_string()),
+                password: values[0].reveal()?,
             }
         };
         let found =
@@ -364,6 +368,7 @@ impl Agent {
                 }
             }
             Request::MailOtp {
+                to,
                 from,
                 print,
                 keyboard,
@@ -375,14 +380,16 @@ impl Agent {
                     join(&from)
                 };
                 match self
-                    .mail_otp(requester, &from, print, keyboard, wait_secs)
+                    .mail_otp(requester, &to, &from, print, keyboard, wait_secs)
                     .await
                 {
                     Ok((found, target)) => {
                         let sender = found.sender.clone();
                         match target {
                             Some(window) => {
-                                eprintln!("{who} typed a mail code from {sender} into {window}");
+                                eprintln!(
+                                    "{who} typed a mail code to {to} from {sender} into {window}"
+                                );
                                 Response::MailCode {
                                     sender,
                                     code: None,
@@ -390,7 +397,7 @@ impl Agent {
                                 }
                             }
                             None => {
-                                eprintln!("{who} got a mail code from {sender}");
+                                eprintln!("{who} got a mail code to {to} from {sender}");
                                 Response::MailCode {
                                     sender,
                                     code: Some(found.code.to_string()),
@@ -400,7 +407,9 @@ impl Agent {
                         }
                     }
                     Err(error) => {
-                        eprintln!("{who} was refused a mail code from {senders}: {error:#}");
+                        eprintln!(
+                            "{who} was refused a mail code to {to} from {senders}: {error:#}"
+                        );
                         Response::Error(format!("{error:#}"))
                     }
                 }
@@ -622,7 +631,11 @@ fn parse_args() -> Result<Args> {
             "--pinentry" => args.pinentry = rest.next().ok_or_else(|| anyhow!("{USAGE}"))?,
             "--mail-login" => {
                 let name = rest.next().ok_or_else(|| anyhow!("{USAGE}"))?;
-                args.mail_login = Some(SecretRef::parse(&name)?);
+                let secret = SecretRef::parse(&name)?;
+                if secret.user.is_some() {
+                    bail!("--mail-login takes no [user]; mail-otp --to picks the inbox");
+                }
+                args.mail_login = Some(secret);
             }
             "-h" | "--help" => {
                 println!("{USAGE}");

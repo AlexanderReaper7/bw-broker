@@ -114,7 +114,9 @@ The first `list` or `search` of an instance needs the master password, because n
 
 ### `mail-otp`: a code from Gmail, typed by default
 
-Reads the inbox over IMAP (`imap.gmail.com:993`, rustls with the webpki roots) with a Google app password. The password is a hidden field on the Google login item, following the API-key scheme; the agent's `--mail-login NAME` names it, and the item's username is the IMAP user. The agent reads both itself after the approval, and they never go to the requester. The inbox is opened with EXAMINE, read-only, and fetched with `BODY.PEEK`, so nothing is marked as read.
+Reads the inbox over IMAP (`imap.gmail.com:993`, rustls with the webpki roots) with a Google app password. The password is a hidden field on the Google login item, following the API-key scheme; the agent's `--mail-login NAME` names it without `[user]`. The agent reads it itself after the approval, and it never goes to the requester.
+
+The user has two Gmail accounts, so each request names the inbox with a required `--to ADDRESS` (the user's choice, 2026-09-28, over checking every configured inbox). The agent reads `item[ADDRESS]/field`, so the address has to be the Google item's exact username, and logs in to IMAP as ADDRESS. The address is not a secret, so it goes in the request and the prompt rather than being read from the vault. Any address with an item and the field works; there is no separate allow-list, since the item holding an app password is already the opt-in. The inbox is opened with EXAMINE, read-only, and fetched with `BODY.PEEK`, so nothing is marked as read.
 
 Every request needs the master password; nothing is cached (the user's choice). A cached approval would let a requester read any later code without the user seeing it.
 
