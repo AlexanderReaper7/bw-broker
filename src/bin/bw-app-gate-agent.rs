@@ -281,7 +281,12 @@ impl Agent {
             _ => unreachable!("find_items only serves list and search"),
         };
         let _prompt = self.prompt.lock().await;
-        let cached = self.cache.lock().await.index(requester.instance, now());
+        let current = tokio::task::spawn_blocking(vault::version).await??;
+        let cached = self
+            .cache
+            .lock()
+            .await
+            .index(requester.instance, current, now());
         let confirmed = cached.is_some();
         let index = match cached {
             Some(index) => {

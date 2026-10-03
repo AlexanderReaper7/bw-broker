@@ -4,7 +4,7 @@
 
 use crate::process::Instance;
 use crate::secret_ref::SecretRef;
-use crate::vault::{Index, SecretValue};
+use crate::vault::{Index, SecretValue, VaultVersion};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -102,9 +102,18 @@ impl Cache {
         Some(&entry.value)
     }
 
-    /// The instance's metadata index, if it has a live one. Resets its idle timer.
-    pub fn index(&mut self, instance: Instance, now: u64) -> Option<Arc<Index>> {
+    /// The instance's metadata index, if it has a live one read from the vault copy at `vault`. Resets its idle timer. An index from an older copy is dropped: it would miss what a sync brought in.
+    pub fn index(
+        &mut self,
+        instance: Instance,
+        vault: VaultVersion,
+        now: u64,
+    ) -> Option<Arc<Index>> {
         let entry = self.indexes.get_mut(&instance)?;
+        if entry.index.version() != vault {
+            self.indexes.remove(&instance);
+            return None;
+        }
         if now.saturating_sub(entry.last_used) >= IDLE_TTL_SECS {
             return None;
         }
@@ -179,6 +188,10 @@ fn expired(entry: &Entry, now: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn v() -> VaultVersion {
+        VaultVersion::test(1)
+    }
 
     const A: Instance = Instance {
         pid: 10,
@@ -302,24 +315,38 @@ mod tests {
     #[test]
     fn index_is_per_instance_and_expires() {
         let mut cache = Cache::default();
-        cache.insert_index(A, Arc::new(Index::default()), 0);
-        assert!(cache.index(B, 1).is_none());
-        assert!(cache.index(A, IDLE_TTL_SECS - 1).is_some());
-        assert!(cache.index(A, 2 * IDLE_TTL_SECS - 2).is_some());
-        assert!(cache.index(A, 3 * IDLE_TTL_SECS).is_none());
-        cache.insert_index(B, Arc::new(Index::default()), 0);
+        cache.insert_index(A, Arc::new(Index::empty(v())), 0);
+        assert!(cache.index(B, v(), 1).is_none());
+        assert!(cache.index(A, v(), IDLE_TTL_SECS - 1).is_some());
+        assert!(cache.index(A, v(), 2 * IDLE_TTL_SECS - 2).is_some());
+        assert!(cache.index(A, v(), 3 * IDLE_TTL_SECS).is_none());
+        cache.insert_index(B, Arc::new(Index::empty(v())), 0);
         cache.sweep(1, |instance| instance == A);
-        assert!(cache.index(B, 1).is_none());
+        assert!(cache.index(B, v(), 1).is_none());
+    }
+
+    #[test]
+    fn an_index_from_an_older_vault_copy_is_dropped() {
+        let mut cache = Cache::default();
+        cache.insert_index(A, Arc::new(Index::empty(v())), 0);
+        let synced = VaultVersion::test(2);
+        assert!(cache.index(A, synced, 1).is_none());
+        assert!(
+            cache.index(A, v(), 2).is_none(),
+            "the stale index stays dropped"
+        );
+        cache.insert_index(A, Arc::new(Index::empty(synced)), 3);
+        assert!(cache.index(A, synced, 4).is_some());
     }
 
     #[test]
     fn forget_all_drops_the_index_and_forget_named_keeps_it() {
         let mut cache = Cache::default();
-        cache.insert_index(A, Arc::new(Index::default()), 0);
+        cache.insert_index(A, Arc::new(Index::empty(v())), 0);
         cache.insert(A, secret("a"), value("1"), Grant::Read, 0);
         assert_eq!(cache.forget(A, &[secret("a")], 1), 1);
-        assert!(cache.index(A, 1).is_some());
+        assert!(cache.index(A, v(), 1).is_some());
         assert_eq!(cache.forget(A, &[], 1), 1);
-        assert!(cache.index(A, 1).is_none());
+        assert!(cache.index(A, v(), 1).is_none());
     }
 }

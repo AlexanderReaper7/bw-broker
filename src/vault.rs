@@ -63,6 +63,7 @@ fn totp_code(seed: &str, unix_time: u64) -> Result<Zeroizing<String>> {
 
 pub struct UnlockedVault {
     entries: Vec<Entry>,
+    version: VaultVersion,
     master_key: locked::Keys,
     org_keys: std::collections::HashMap<String, locked::Keys>,
 }
@@ -78,23 +79,54 @@ impl<E: Into<anyhow::Error>> From<E> for UnlockError {
     }
 }
 
-/// Loads rbw's vault copy and derives the keys from the master password. This runs the account's KDF, which takes around a second.
-pub fn unlock(password: &SecretString) -> Result<UnlockedVault, UnlockError> {
+/// Which contents of rbw's vault copy something was read from: a hash of the items, still encrypted. rbw rewrites the copy on every sync with new access and refresh tokens, which are left out, so a sync that changed no item keeps the version. Only compared within one agent process.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VaultVersion(u64);
+
+impl VaultVersion {
+    fn of(entries: &[Entry]) -> Result<Self> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        serde_json::to_vec(entries)?.hash(&mut hasher);
+        Ok(Self(hasher.finish()))
+    }
+}
+
+#[cfg(test)]
+impl VaultVersion {
+    pub(crate) fn test(n: u64) -> Self {
+        Self(n)
+    }
+}
+
+/// The version of rbw's vault copy as it is now. Needs no key.
+pub fn version() -> Result<VaultVersion> {
+    VaultVersion::of(&load_db()?.1.entries)
+}
+
+/// The account's email and rbw's vault copy.
+fn load_db() -> Result<(String, rbw::db::Db)> {
     let config = rbw::config::Config::load()
         .context("failed to load rbw config; run `rbw config set email ...`")?;
     let email = config
         .email
-        .as_deref()
+        .clone()
         .ok_or_else(|| anyhow!("rbw config has no email"))?;
-    let db = rbw::db::Db::load(&config.server_name(), email)
+    let db = rbw::db::Db::load(&config.server_name(), &email)
         .context("failed to load rbw's vault copy; run `rbw login` and `rbw sync`")?;
+    Ok((email, db))
+}
+
+/// Loads rbw's vault copy and derives the keys from the master password. This runs the account's KDF, which takes around a second.
+pub fn unlock(password: &SecretString) -> Result<UnlockedVault, UnlockError> {
+    let (email, db) = load_db()?;
 
     let mut password_bytes = locked::Vec::new();
     password_bytes.extend(password.expose_secret().bytes());
     let password = locked::Password::new(password_bytes);
 
     let unlocked = rbw::actions::unlock(
-        email,
+        &email,
         &password,
         db.kdf.ok_or_else(|| anyhow!("vault copy has no KDF"))?,
         db.iterations
@@ -115,6 +147,7 @@ pub fn unlock(password: &SecretString) -> Result<UnlockedVault, UnlockError> {
         Err(error) => return Err(error.into()),
     };
     Ok(UnlockedVault {
+        version: VaultVersion::of(&db.entries)?,
         entries: db.entries,
         master_key,
         org_keys,
@@ -161,12 +194,14 @@ impl UnlockedVault {
 
     /// The metadata of every item, for `list` and `search`. Items that fail to decrypt are left out, as in `find_entry`.
     pub fn index(&self) -> Index {
-        Index(
-            self.entries
+        Index {
+            metadata: self
+                .entries
                 .iter()
                 .filter_map(|entry| self.metadata(entry).ok())
                 .collect(),
-        )
+            version: self.version,
+        }
     }
 
     /// Decrypts the metadata of one entry. Notes and hidden field values are left encrypted.
@@ -272,11 +307,27 @@ impl UnlockedVault {
     }
 }
 
-/// The decrypted metadata of every item: what `list` and `search` read. The agent keeps one per instance after a password approval, so later queries only need a confirmation. It holds no values: notes and hidden fields stay encrypted in the vault copy.
+/// The decrypted metadata of every item: what `list` and `search` read. The agent keeps one per instance after a password approval, so later queries only need a confirmation, until the vault copy it was read from changes. It holds no values: notes and hidden fields stay encrypted in the vault copy.
 #[derive(Default)]
-pub struct Index(Vec<Metadata>);
+pub struct Index {
+    metadata: Vec<Metadata>,
+    version: VaultVersion,
+}
 
 impl Index {
+    #[cfg(test)]
+    pub(crate) fn empty(version: VaultVersion) -> Self {
+        Self {
+            metadata: Vec::new(),
+            version,
+        }
+    }
+
+    /// The version of the vault copy this index was read from.
+    pub fn version(&self) -> VaultVersion {
+        self.version
+    }
+
     /// The items named exactly `item`.
     pub fn list(&self, item: &str) -> Vec<Item> {
         self.items(|metadata| metadata.name == item)
@@ -299,7 +350,7 @@ impl Index {
     /// Items whose metadata passes `keep`, sorted by gate name.
     fn items(&self, keep: impl Fn(&Metadata) -> bool) -> Vec<Item> {
         let mut items: Vec<Item> = self
-            .0
+            .metadata
             .iter()
             .filter(|metadata| keep(metadata))
             .map(|metadata| Item {
@@ -440,6 +491,7 @@ mod tests {
         let encrypted_entry_key =
             encrypt(&base, &[entry_key.enc_key(), entry_key.mac_key()].concat());
         let vault = UnlockedVault {
+            version: VaultVersion::default(),
             entries: vec![],
             master_key: base,
             org_keys: Default::default(),
@@ -463,6 +515,7 @@ mod tests {
             master_password_reprompt: rbw::api::CipherRepromptType::None,
         };
         let vault = UnlockedVault {
+            version: VaultVersion::default(),
             entries: vec![entry],
             ..vault
         };
@@ -501,6 +554,7 @@ mod tests {
     fn username_picks_among_same_named_items() {
         let keys = test_keys(17);
         let vault = UnlockedVault {
+            version: VaultVersion::default(),
             entries: vec![
                 login(&keys, "test", "username1", "1"),
                 login(&keys, "test", "username2", "22"),
@@ -529,6 +583,26 @@ mod tests {
     }
 
     #[test]
+    fn the_version_follows_the_items() {
+        let keys = test_keys(19);
+        let item = login(&keys, "huggingface.co", "alice", "pw");
+        let before = VaultVersion::of(std::slice::from_ref(&item)).unwrap();
+        assert_eq!(
+            VaultVersion::of(std::slice::from_ref(&item.clone())).unwrap(),
+            before
+        );
+        let mut field_added = item.clone();
+        field_added.fields.push(rbw::db::Field {
+            ty: Some(rbw::api::FieldType::Hidden),
+            name: Some(encrypt(&keys, b"apikey")),
+            value: Some(encrypt(&keys, b"hf_x")),
+            linked_id: None,
+        });
+        assert_ne!(VaultVersion::of(&[field_added]).unwrap(), before);
+        assert_ne!(VaultVersion::of(&[item.clone(), item]).unwrap(), before);
+    }
+
+    #[test]
     fn list_and_search_see_metadata_only() {
         let keys = test_keys(19);
         let text = |name: &str, value: &str, ty| rbw::db::Field {
@@ -553,6 +627,7 @@ mod tests {
         let personal = login(&keys, "GitHub", "bob", "pw2");
         let other = login(&keys, "Other/site", "carol[x]", "pw3");
         let vault = UnlockedVault {
+            version: VaultVersion::default(),
             entries: vec![work, personal, other],
             master_key: test_keys(19),
             org_keys: Default::default(),
