@@ -78,3 +78,7 @@ timeout_ms = 130000
 - `examples/type-probe.rs` tests typing live without the vault: `cargo run --example type-probe -- [--password|--keyboard] TEXT`.
 - `examples/mail-probe.rs` tests `mail-otp` without the agent, reading the app password from stdin.
 - `nix/` has the package and the home-manager module.
+
+## License
+
+bw-broker is licensed under the GNU Affero General Public License, version 3 only ([LICENSE](LICENSE)). Copyright (c) 2026 Alexander Öberg.

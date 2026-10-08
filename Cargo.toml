@@ -2,6 +2,8 @@
 name = "bw-broker"
 version = "0.1.0"
 edition = "2021"
+license = "AGPL-3.0-only"
+repository = "https://github.com/AlexanderReaper7/bw-broker"
 
 [dependencies]
 rbw = { version = "1.15", default-features = false }

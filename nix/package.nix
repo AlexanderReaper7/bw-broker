@@ -30,6 +30,8 @@ rustPlatform.buildRustPackage {
 
   meta = {
     description = "Per-application gate in front of a Bitwarden vault, with a pinentry approval prompt";
+    homepage = "https://github.com/AlexanderReaper7/bw-broker";
+    license = lib.licenses.agpl3Only;
     mainProgram = "bw-broker";
     platforms = lib.platforms.linux;
   };
