@@ -140,3 +140,7 @@ The code is typed by default, like `type` but into any field (no password field 
 ## Name: bw-broker, renamed from bw-app-gate (2026-10-08)
 
 The requester stopped being an application once it became an agent session, so "app-gate" no longer fit. The user's first pick was `bw-agent`. It was dropped for two reasons. It is one letter from `rbw-agent`, and the rule this project most depends on is never to unlock rbw-agent, so a misread in a log line or a `systemctl` command costs the most here. Second, the daemon would have been `bw-agent-agent`, and "agent" already means both the daemon and the AI caller in these docs. The client is `bw-broker`, the daemon `bw-brokerd`, the socket `/run/user/<uid>/bw-broker.sock`. The Gmail app-password field moved from `bw-app-gate-imap` to `bw-broker-imap` in the vault as well.
+
+## Icon: the Bitwarden shield as the character being typed (2026-10-08)
+
+`assets/icon.svg` shows a terminal prompt, `> _`, with Bitwarden's shield in the cursor's place, the character being typed. The shield must be Bitwarden's own half-filled one, the path from their brand kit (bitwarden.com/brand), not a lookalike. The prompt is Swedish flag yellow `#FECC02` on Bitwarden Blue `#175DDC`. Rejected along the way: a generic shield with a prompt cut into it, a shield with a yellow object in front (key, padlock, envelope, agent head), and a block cursor over the shield. The brand page sets no rule on modifying the shield or using it in third-party projects; that question is open if this repository goes public.

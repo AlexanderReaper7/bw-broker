@@ -1,4 +1,4 @@
-# bw-broker
+# <img src="assets/icon.svg" width="40" align="top"> bw-broker
 
 Programs ask for Bitwarden secrets by name. A pinentry dialog shows which program asks for what, and entering the master password approves it. The approved secrets are then cached for that one process for up to 15 minutes of idle time.
 
