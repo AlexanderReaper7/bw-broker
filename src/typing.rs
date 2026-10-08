@@ -1,4 +1,4 @@
-//! Typing a value into the focused text field, for `bw-app-gate type`.
+//! Typing a value into the focused text field, for `bw-broker type`.
 //!
 //! The default is a short-lived Wayland input method. The compositor tells an input method when a text field gains or loses focus and what the field is for, so a password is only sent to a field that says it is a password field, and a click that moves focus shows up as `deactivate`. The value goes in one `commit_string`, which the compositor delivers to the focused field only.
 //!
@@ -441,7 +441,7 @@ fn keymap() -> Result<(OwnedFd, u32)> {
     let mut bytes = text.into_bytes();
     bytes.push(0);
 
-    let fd = unsafe { libc::memfd_create(c"bw-app-gate-keymap".as_ptr(), libc::MFD_CLOEXEC) };
+    let fd = unsafe { libc::memfd_create(c"bw-broker-keymap".as_ptr(), libc::MFD_CLOEXEC) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error()).context("memfd_create");
     }

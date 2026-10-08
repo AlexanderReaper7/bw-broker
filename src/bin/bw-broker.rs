@@ -1,5 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
-use bw_app_gate::{socket_path, Item, MailOtp, Request, Response};
+use bw_broker::{socket_path, Item, MailOtp, Request, Response};
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -7,14 +7,14 @@ use std::process::Command;
 use zeroize::Zeroizing;
 
 const USAGE: &str = "\
-Usage: bw-app-gate get NAME...
-       bw-app-gate type [--keyboard] [--into WINDOW] NAME
-       bw-app-gate list ITEM
-       bw-app-gate search WORD...
-       bw-app-gate mail-otp --to ADDRESS [--from DOMAIN]... [--print | --keyboard]
+Usage: bw-broker get NAME...
+       bw-broker type [--keyboard] [--into WINDOW] NAME
+       bw-broker list ITEM
+       bw-broker search WORD...
+       bw-broker mail-otp --to ADDRESS [--from DOMAIN]... [--print | --keyboard]
                             [--into WINDOW] [--wait SECS]
-       bw-app-gate forget [NAME...]
-       bw-app-gate login
+       bw-broker forget [NAME...]
+       bw-broker login
 
 NAME is an item name, meaning its login password, or ITEM/FIELD where FIELD is
 username, notes, totp or a custom field name. Escape '/' and '\\' in names
@@ -65,7 +65,7 @@ process of this user, around the gate.";
 fn request(request: &Request) -> Result<Response> {
     let mut stream = UnixStream::connect(socket_path()).with_context(|| {
         format!(
-            "failed to connect to {}; is bw-app-gate-agent running?",
+            "failed to connect to {}; is bw-brokerd running?",
             socket_path().display()
         )
     })?;
@@ -186,7 +186,7 @@ fn mail_otp(args: &[String]) -> Result<()> {
     let mut print = false;
     let mut keyboard = false;
     let mut into = None;
-    let mut wait_secs = bw_app_gate::mail::DEFAULT_WAIT.as_secs();
+    let mut wait_secs = bw_broker::mail::DEFAULT_WAIT.as_secs();
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {

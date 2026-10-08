@@ -1,5 +1,5 @@
 {
-  description = "bw-app-gate: per-application approval gate in front of a Bitwarden vault";
+  description = "bw-broker: per-application approval gate in front of a Bitwarden vault";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 

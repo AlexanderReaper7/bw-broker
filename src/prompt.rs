@@ -49,7 +49,7 @@ impl Approval<'_> {
         let mut input = PassphraseInput::with_binary(self.pinentry)
             .ok_or_else(|| anyhow!("pinentry program '{}' not found", self.pinentry))?;
         input
-            .with_title("bw-app-gate")
+            .with_title("bw-broker")
             .with_description(&description)
             .with_prompt("Master password:")
             .with_ok("Approve")
@@ -71,7 +71,7 @@ impl Approval<'_> {
         let mut dialog = ConfirmationDialog::with_binary(self.pinentry)
             .ok_or_else(|| anyhow!("pinentry program '{}' not found", self.pinentry))?;
         dialog
-            .with_title("bw-app-gate")
+            .with_title("bw-broker")
             .with_ok("Approve")
             .with_cancel("Deny")
             .with_timeout(TIMEOUT_SECS);

@@ -1,6 +1,6 @@
 //! Finding the requesting application from the connecting process.
 //!
-//! The requester is the nearest process, starting from the one that connected, whose executable is neither a shell, a Python interpreter nor the `bw-app-gate` client. For an agent that runs `bash -c "bw-app-gate get ..."` this lands on the agent itself, so one agent session is one instance.
+//! The requester is the nearest process, starting from the one that connected, whose executable is neither a shell, a Python interpreter nor the `bw-broker` client. For an agent that runs `bash -c "bw-broker get ..."` this lands on the agent itself, so one agent session is one instance.
 //!
 //! Everything reads `/proc` directly and fails closed: an unreadable `exe` link is an error, never a fallback to the self-reported process name.
 
@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Executable file names skipped while walking up. Wrappers that only run another program belong here.
-const PASS_THROUGH: &[&str] = &["sh", "bash", "dash", "zsh", "fish", "env", "bw-app-gate"];
+const PASS_THROUGH: &[&str] = &["sh", "bash", "dash", "zsh", "fish", "env", "bw-broker"];
 
 /// Whether an executable file name is skipped while walking up: one of `PASS_THROUGH`, or a Python interpreter, `python` followed by a version of digits and dots (`python3.14`).
 fn is_pass_through(file_name: &str) -> bool {

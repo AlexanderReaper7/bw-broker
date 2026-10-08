@@ -1,4 +1,4 @@
-//! Shared code for the `bw-app-gate` client and `bw-app-gate-agent` daemon.
+//! Shared code for the `bw-broker` client and `bw-brokerd` daemon.
 //!
 //! Design decisions and their reasons live in `docs/decisions.md`.
 
@@ -80,5 +80,5 @@ pub struct Item {
 
 pub fn socket_path() -> PathBuf {
     let uid = unsafe { libc::getuid() };
-    PathBuf::from(format!("/run/user/{uid}/bw-app-gate.sock"))
+    PathBuf::from(format!("/run/user/{uid}/bw-broker.sock"))
 }

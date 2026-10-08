@@ -1,12 +1,12 @@
 use anyhow::{anyhow, bail, Context, Result};
-use bw_app_gate::cache::{Cache, Grant};
-use bw_app_gate::mail::{self, Found, Login};
-use bw_app_gate::process::{self, app_label, tilde, Requester};
-use bw_app_gate::prompt::Approval;
-use bw_app_gate::secret_ref::{Field, SecretRef};
-use bw_app_gate::typing::{self, Desktop, Window};
-use bw_app_gate::vault::{self, UnlockError, UnlockedVault};
-use bw_app_gate::{
+use bw_broker::cache::{Cache, Grant};
+use bw_broker::mail::{self, Found, Login};
+use bw_broker::process::{self, app_label, tilde, Requester};
+use bw_broker::prompt::Approval;
+use bw_broker::secret_ref::{Field, SecretRef};
+use bw_broker::typing::{self, Desktop, Window};
+use bw_broker::vault::{self, UnlockError, UnlockedVault};
+use bw_broker::{
     socket_path, Item, MailOtp, Request, Response, MAX_REQUEST_BYTES, MAX_SECRETS_PER_REQUEST,
 };
 use std::os::unix::fs::PermissionsExt;
@@ -17,7 +17,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
-const USAGE: &str = "Usage: bw-app-gate-agent [--pinentry PROGRAM] [--mail-login NAME]\n\nNAME is the hidden field holding the Gmail app password for mail-otp, without [user]: google.com/bw-app-gate-imap. Each mail-otp request names the inbox with --to, which picks the item whose username is that address.";
+const USAGE: &str = "Usage: bw-brokerd [--pinentry PROGRAM] [--mail-login NAME]\n\nNAME is the hidden field holding the Gmail app password for mail-otp, without [user]: google.com/bw-broker-imap. Each mail-otp request names the inbox with --to, which picks the item whose username is that address.";
 
 /// Wrong master passwords accepted in one prompt before the request fails.
 const PASSWORD_ATTEMPTS: usize = 3;
@@ -617,7 +617,7 @@ fn bind_socket() -> Result<UnixListener> {
     let path = socket_path();
     if std::os::unix::net::UnixStream::connect(&path).is_ok() {
         bail!(
-            "another bw-app-gate-agent is already listening on {}",
+            "another bw-brokerd is already listening on {}",
             path.display()
         );
     }
@@ -692,7 +692,7 @@ async fn main() -> Result<()> {
     });
 
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    eprintln!("bw-app-gate-agent listening on {}", socket_path().display());
+    eprintln!("bw-brokerd listening on {}", socket_path().display());
     loop {
         tokio::select! {
             accepted = listener.accept() => {

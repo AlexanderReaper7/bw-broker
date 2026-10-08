@@ -8,11 +8,11 @@ The gate stops an application from getting a secret nobody approved for it, and 
 
 ## Delivery: a daemon and a small CLI
 
-`bw-app-gate-agent` holds the cache and shows prompts. `bw-app-gate get NAME...` asks it over `/run/user/<uid>/bw-app-gate.sock` and prints to stdout. One name prints the raw value with no trailing newline, so `$(...)` gets it exactly. Several names print one JSON object. A launcher (`run -- app`) was considered and left out: under this threat model the daemon would have to trust whatever the launcher said it was starting, which is no stronger than inspecting the caller.
+`bw-brokerd` holds the cache and shows prompts. `bw-broker get NAME...` asks it over `/run/user/<uid>/bw-broker.sock` and prints to stdout. One name prints the raw value with no trailing newline, so `$(...)` gets it exactly. Several names print one JSON object. A launcher (`run -- app`) was considered and left out: under this threat model the daemon would have to trust whatever the launcher said it was starting, which is no stronger than inspecting the caller.
 
 ## The requester is the nearest ancestor that is not a shell or Python
 
-The agent walks up from the connecting process past `sh`, `bash`, `dash`, `zsh`, `fish`, `env` and the `bw-app-gate` client, and the first other process is the requester. An agent that runs `bash -c "bw-app-gate get x"` gets a new bash per call, so the direct parent would make every call a new requester and the cache useless. The walk lands on the agent process itself, so one agent session is one requester, which is also the scoping planned for later.
+The agent walks up from the connecting process past `sh`, `bash`, `dash`, `zsh`, `fish`, `env` and the `bw-broker` client, and the first other process is the requester. An agent that runs `bash -c "bw-broker get x"` gets a new bash per call, so the direct parent would make every call a new requester and the cache useless. The walk lands on the agent process itself, so one agent session is one requester, which is also the scoping planned for later.
 
 Python interpreters are skipped too since 2026-09-23, matched as `python` followed by digits and dots, because the file name carries the version (`python3.14`). Codex ran a Python snippet per secret, and every snippet was a new process, so every one prompted. The cost is that a Python program run as an application of its own, such as a user service, is attributed to its parent and shares that instance's cache with the parent's other children. Shell scripts already had that cost.
 
@@ -30,9 +30,9 @@ Screen lock and suspend do not clear the cache: agent sessions keep running whil
 
 ## Forget: a process can drop only its own approvals (2026-09-23)
 
-`bw-app-gate forget [NAME...]` drops the calling instance's entries, the named ones or all of them, with no prompt. It exists so a program that is done with a secret, or that fetched a stale one, can give up access before it exits or goes idle. The instance is resolved the same way as for `get`, so a shell script run by a program forgets on that program's behalf.
+`bw-broker forget [NAME...]` drops the calling instance's entries, the named ones or all of them, with no prompt. It exists so a program that is done with a secret, or that fetched a stale one, can give up access before it exits or goes idle. The instance is resolved the same way as for `get`, so a shell script run by a program forgets on that program's behalf.
 
-A program can not forget another program's approvals. Options considered were `--all` for every instance and `--pid N` for one other instance. Either would let any process of the user force re-prompts on every other one. That harm is small, but it is not needed: restarting `bw-app-gate-agent` already clears everything, because the cache exists only in its memory. Gating a clear-all on root was also suggested, but a root check would protect nothing that a same-user restart or kill does not already allow.
+A program can not forget another program's approvals. Options considered were `--all` for every instance and `--pid N` for one other instance. Either would let any process of the user force re-prompts on every other one. That harm is small, but it is not needed: restarting `bw-brokerd` already clears everything, because the cache exists only in its memory. Gating a clear-all on root was also suggested, but a root check would protect nothing that a same-user restart or kill does not already allow.
 
 ## Prompt: one dialog per request, listing only what is new
 
@@ -44,7 +44,7 @@ Since 2026-09-23 the dialog also shows the requester's working directory and the
 
 ## Audit log: one journal line per request, names only (2026-09-23)
 
-The agent writes one line to stderr, so to the journal, for every request: the requester with its PID and working directory, the names, and the outcome. For `get` the outcome is either "all cached" or which names needed approval. A refusal includes its reason, and a `forget` includes the count. Values are never logged. The threat model is honest apps that should not get more than they need, and before this nothing showed what an app fetched or how often. Read it with `journalctl --user -u bw-app-gate-agent`.
+The agent writes one line to stderr, so to the journal, for every request: the requester with its PID and working directory, the names, and the outcome. For `get` the outcome is either "all cached" or which names needed approval. A refusal includes its reason, and a `forget` includes the count. Values are never logged. The threat model is honest apps that should not get more than they need, and before this nothing showed what an app fetched or how often. Read it with `journalctl --user -u bw-brokerd`.
 
 ## Unlock: master password on every cache miss, keys dropped afterwards
 
@@ -78,7 +78,7 @@ Never run `rbw unlock` on this machine: an unlocked rbw-agent hands any secret t
 
 `rbw login` unlocks the agent as well, which was missed at first. Its `login_success` in rbw 1.15 syncs and then calls `rbw::actions::unlock`, keeping the keys for `lock_timeout` (3600 s by default). Found on 2026-09-22 when `rbw unlocked` exited 0 right after the first login. Decided the same day: run `rbw login && rbw lock`, every time rbw asks for a login. Setting `lock_timeout = 1` in the module was the alternative, and would close the window without anyone having to remember. The user chose the documented step instead.
 
-On 2026-09-23 the step became a command, `bw-app-gate login`, so it does not rely on memory. It runs `rbw login` and then `rbw lock` whatever the login did, since `&&` skips the lock when a login fails after unlocking. It catches Ctrl-C, SIGTERM, SIGHUP and SIGQUIT with a handler that does nothing, rather than ignoring them. exec resets handled signals to their default, so Ctrl-C still stops `rbw login`, and this process lives on to lock. A shell script with a `trap` in the nix module was the alternative. It was dropped because the command would only exist through the module.
+On 2026-09-23 the step became a command, `bw-broker login`, so it does not rely on memory. It runs `rbw login` and then `rbw lock` whatever the login did, since `&&` skips the lock when a login fails after unlocking. It catches Ctrl-C, SIGTERM, SIGHUP and SIGQUIT with a handler that does nothing, rather than ignoring them. exec resets handled signals to their default, so Ctrl-C still stops `rbw login`, and this process lives on to lock. A shell script with a `trap` in the nix module was the alternative. It was dropped because the command would only exist through the module.
 
 ## Known non-goal: cold boot attacks
 
@@ -136,3 +136,7 @@ The code: 4 to 8 digit numbers standing alone, or two equal groups of 3 or 4 dig
 The link and own-line rules were added 2026-09-28 after Microsoft's Entra guest-account mail failed as ambiguous. Its footer, "If you didn't request a code, you can ignore this email", put `?LinkId=521839` and the ZIP code in `Redmond, WA 98052` within reach of the keyword, while the code itself stood alone on a line. The user chose the own-line tiebreak over stopping the keyword's reach at a blank line, which would break mails like `Your code:\n\n4839`, and over a postal-code rule, which would fix this sender and nothing else. Two numbers alone on their lines still fail.
 
 The code is typed by default, like `type` but into any field (no password field check); `--print` returns it instead. The reply names the sender domain and never includes the body. Magic links are left out of the first version.
+
+## Name: bw-broker, renamed from bw-app-gate (2026-10-08)
+
+The requester stopped being an application once it became an agent session, so "app-gate" no longer fit. The user's first pick was `bw-agent`. It was dropped for two reasons. It is one letter from `rbw-agent`, and the rule this project most depends on is never to unlock rbw-agent, so a misread in a log line or a `systemctl` command costs the most here. Second, the daemon would have been `bw-agent-agent`, and "agent" already means both the daemon and the AI caller in these docs. The client is `bw-broker`, the daemon `bw-brokerd`, the socket `/run/user/<uid>/bw-broker.sock`. The Gmail app-password field moved from `bw-app-gate-imap` to `bw-broker-imap` in the vault as well.

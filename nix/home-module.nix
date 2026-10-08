@@ -10,7 +10,7 @@
 # The rbw-agent never gets unlocked by anything here. Running `rbw unlock`
 # would let every process of this user read the vault through `rbw get`,
 # around the gate. `rbw login` unlocks it as a side effect, so logins go through
-# `bw-app-gate login`, which always runs `rbw lock` afterwards.
+# `bw-broker login`, which always runs `rbw lock` afterwards.
 self:
 {
   config,
@@ -20,11 +20,11 @@ self:
 }:
 
 let
-  cfg = config.services.bw-app-gate;
+  cfg = config.services.bw-broker;
 in
 {
-  options.services.bw-app-gate = {
-    enable = lib.mkEnableOption "bw-app-gate, a per-application approval gate in front of rbw's vault copy";
+  options.services.bw-broker = {
+    enable = lib.mkEnableOption "bw-broker, a per-application approval gate in front of rbw's vault copy";
 
     targetCpu = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
@@ -47,8 +47,8 @@ in
     mailLogin = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
       default = null;
-      example = "google.com/bw-app-gate-imap";
-      description = "Gate name, without [user], of the hidden field holding a Gmail app password, for `bw-app-gate mail-otp`. `mail-otp --to ADDRESS` reads the field on the item whose username is ADDRESS, and ADDRESS is the IMAP user. null turns mail-otp off.";
+      example = "google.com/bw-broker-imap";
+      description = "Gate name, without [user], of the hidden field holding a Gmail app password, for `bw-broker mail-otp`. `mail-otp --to ADDRESS` reads the field on the item whose username is ADDRESS, and ADDRESS is the IMAP user. null turns mail-otp off.";
     };
 
     pinentry = lib.mkOption {
@@ -70,9 +70,9 @@ in
     };
 
     systemd.user.services = {
-      bw-app-gate-agent = {
+      bw-brokerd = {
         Unit = {
-          Description = "bw-app-gate approval agent";
+          Description = "bw-broker approval agent";
           # pinentry-gnome3 asks gcr-prompter over D-Bus to draw the dialog,
           # and gcr-prompter needs WAYLAND_DISPLAY, which the compositor only
           # exports once the graphical session is up.
@@ -81,7 +81,7 @@ in
         };
         Service = {
           ExecStart =
-            "${lib.getExe' cfg.package "bw-app-gate-agent"} --pinentry ${lib.getExe cfg.pinentry}"
+            "${lib.getExe' cfg.package "bw-brokerd"} --pinentry ${lib.getExe cfg.pinentry}"
             + lib.optionalString (cfg.mailLogin != null) " --mail-login ${lib.escapeShellArg cfg.mailLogin}";
           Restart = "on-failure";
           # The cache holds approved secrets in memory only. No core dumps, and

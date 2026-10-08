@@ -30,7 +30,7 @@ rustPlatform.buildRustPackage {
 
   meta = {
     description = "Per-application gate in front of a Bitwarden vault, with a pinentry approval prompt";
-    mainProgram = "bw-app-gate";
+    mainProgram = "bw-broker";
     platforms = lib.platforms.linux;
   };
 }

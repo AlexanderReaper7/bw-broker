@@ -1,8 +1,8 @@
 //! Live check of `mail` without the agent: waits for a code and prints its sender and length, never the code.
 //! The app password is read from stdin, so it stays out of argv:
-//! `bw-app-gate get 'google.com[you@gmail.com]/bw-app-gate-imap' | cargo run --example mail-probe -- you@gmail.com [--from DOMAIN]... [--wait SECS]`
+//! `bw-broker get 'google.com[you@gmail.com]/bw-broker-imap' | cargo run --example mail-probe -- you@gmail.com [--from DOMAIN]... [--wait SECS]`
 use anyhow::{anyhow, Context};
-use bw_app_gate::mail::{self, Login};
+use bw_broker::mail::{self, Login};
 use std::io::Read;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use zeroize::Zeroizing;
